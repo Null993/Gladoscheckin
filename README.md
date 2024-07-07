@@ -2,7 +2,7 @@
 
 ## 食用方式：
 
-### 注册一个GLaDOS的账号([注册地址][https://glados.space/landing/YXXW6-BQ9WG-BDNO0-AWHS4])
+### 注册一个GLaDOS的账号([注册地址](https://glados.space/landing/YXXW6-BQ9WG-BDNO0-AWHS4))
 
 #### 我的邀请码：YXXW6-BQ9WG-BDNO0-AWHS4
 
