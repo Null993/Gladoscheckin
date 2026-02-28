@@ -1,43 +1,95 @@
 import requests,json,os
 import math
+import sys
+
+
 # -------------------------------------------------------------------------------------------
-# github workflows  ？111212111
+# GLADOS 自动签到 稳定增强版
 # -------------------------------------------------------------------------------------------
+
 if __name__ == '__main__':
-# pushplus秘钥 申请地址 http://www.pushplus.plus
-    sckey = os.environ.get("PUSHPLUS_TOKEN", "")
-# 推送内容
-    sendContent = ''
-# glados账号cookie 直接使用数组 如果使用环境变量需要字符串分割一下
-    cookies = os.environ.get("GLADOS_COOKIE", []).split("&")
-    if cookies[0] == "":
-        print('未获取到COOKIE变量') 
-        cookies = []
-        exit(0)
-    url= "https://glados.rocks/api/user/checkin"
-    url2= "https://glados.rocks/api/user/status"
-    referer = 'https://glados.rocks/console/checkin'
-    origin = "https://glados.rocks"
-    useragent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36"
-    payload={
-        'token': 'glados.one'
+
+    # PushPlus Token
+    PUSH_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
+
+    # 推荐从环境变量读取
+    GLADOS_COOKIE = os.environ.get("GLADOS_COOKIE", "")
+
+    # 如果本地测试，可以取消下面注释填写
+    GLADOS_COOKIE = ""
+
+    if not GLADOS_COOKIE:
+        print("未获取到 GLADOS_COOKIE")
+        sys.exit(0)
+
+    checkin_url = "https://glados.rocks/api/user/checkin"
+    status_url = "https://glados.rocks/api/user/status"
+
+    headers = {
+        "cookie": GLADOS_COOKIE,
+        "referer": "https://glados.rocks/console/checkin",
+        "origin": "https://glados.rocks",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "content-type": "application/json;charset=UTF-8"
     }
-    for cookie in cookies:
-        checkin = requests.post(url,headers={'cookie': cookie ,'referer': referer,'origin':origin,'user-agent':useragent,'content-type':'application/json;charset=UTF-8'},data=json.dumps(payload))
-        state =  requests.get(url2,headers={'cookie': cookie ,'referer': referer,'origin':origin,'user-agent':useragent})
-    #--------------------------------------------------------------------------------------------------------#  
-        time = state.json()['data']['leftDays']
-        time = time.split('.')[0]
-        email = state.json()['data']['email']
-        if 'message' in checkin.text:
-            mess = checkin.json()['message']
-            print(email+'----结果--'+mess+'----剩余('+time+')天')  # 日志输出
-            sendContent += email+'----'+mess+'----剩余('+time+')天\n'
-        else:
-            requests.get('http://www.pushplus.plus/send?token=' + sckey + '&content='+email+'cookie已失效')
-            print('cookie已失效')  # 日志输出
-     #--------------------------------------------------------------------------------------------------------#   
-    if sckey != "":
-         requests.get('http://www.pushplus.plus/send?token=' + sckey + '&title='+email+'签到成功'+'&content='+sendContent)
 
+    payload = {
+        "token": "glados.cloud"
+    }
 
+    sendContent = ""
+
+    try:
+        # -------------------- 签到 --------------------
+        checkin = requests.post(checkin_url, headers=headers, json=payload, timeout=15)
+        checkin_json = checkin.json()
+
+    except Exception as e:
+        print("签到请求失败:", e)
+        sys.exit(1)
+
+    try:
+        # -------------------- 获取状态 --------------------
+        state = requests.get(status_url, headers=headers, timeout=15)
+        state_json = state.json()
+
+    except Exception as e:
+        print("状态请求失败:", e)
+        sys.exit(1)
+
+    # -------------------- 权限检测 --------------------
+    if state_json.get("code") != 0:
+        message = state_json.get("message", "未知错误")
+        print("Cookie失效或无权限:", message)
+
+        if PUSH_TOKEN:
+            requests.get(
+                f"http://www.pushplus.plus/send?token={PUSH_TOKEN}&title=GLADOS签到失败&content=Cookie失效"
+            )
+        sys.exit(0)
+
+    # -------------------- 正常数据 --------------------
+    try:
+        left_days = state_json["data"]["leftDays"].split('.')[0]
+        email = state_json["data"]["email"]
+    except KeyError:
+        print("接口结构发生变化:", state_json)
+        sys.exit(1)
+
+    # -------------------- 签到结果 --------------------
+    if checkin_json.get("code") == 0:
+        message = checkin_json.get("message", "签到成功")
+    else:
+        message = checkin_json.get("message", "未知状态")
+
+    result_text = f"{email} ---- {message} ---- 剩余({left_days})天"
+
+    print(result_text)
+
+    sendContent += result_text
+
+    # -------------------- 推送 --------------------
+    if PUSH_TOKEN:
+        requests.get(
+            f"http://www.pushplus.plus/send?token={PUSH_TOKEN}&title=GLADOS签到通知&content={sendContent}"
+        )
