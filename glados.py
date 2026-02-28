@@ -1,22 +1,22 @@
-import requests,json,os
-import math
+import requests
+import os
 import sys
 
-
 # -------------------------------------------------------------------------------------------
-# GLADOS 自动签到 稳定增强版
+# GLADOS 自动签到 - 企业微信机器人版
 # -------------------------------------------------------------------------------------------
 
 if __name__ == '__main__':
 
-    # PushPlus Token
-    PUSH_TOKEN = os.environ.get("PUSHPLUS_TOKEN", "")
+    # 企业微信机器人 webhook
+    WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")
 
-    # 推荐从环境变量读取
+    # GLADOS Cookie
     GLADOS_COOKIE = os.environ.get("GLADOS_COOKIE", "")
 
-    # 如果本地测试，可以取消下面注释填写
-    GLADOS_COOKIE = ""
+    # 本地测试可手动填写
+    # GLADOS_COOKIE = ""
+    # WECOM_WEBHOOK = ""
 
     if not GLADOS_COOKIE:
         print("未获取到 GLADOS_COOKIE")
@@ -37,13 +37,10 @@ if __name__ == '__main__':
         "token": "glados.cloud"
     }
 
-    sendContent = ""
-
     try:
         # -------------------- 签到 --------------------
         checkin = requests.post(checkin_url, headers=headers, json=payload, timeout=15)
         checkin_json = checkin.json()
-
     except Exception as e:
         print("签到请求失败:", e)
         sys.exit(1)
@@ -52,7 +49,6 @@ if __name__ == '__main__':
         # -------------------- 获取状态 --------------------
         state = requests.get(status_url, headers=headers, timeout=15)
         state_json = state.json()
-
     except Exception as e:
         print("状态请求失败:", e)
         sys.exit(1)
@@ -62,10 +58,15 @@ if __name__ == '__main__':
         message = state_json.get("message", "未知错误")
         print("Cookie失效或无权限:", message)
 
-        if PUSH_TOKEN:
-            requests.get(
-                f"http://www.pushplus.plus/send?token={PUSH_TOKEN}&title=GLADOS签到失败&content=Cookie失效"
-            )
+        if WECOM_WEBHOOK:
+            msg = {
+                "msgtype": "text",
+                "text": {
+                    "content": f"GLADOS签到失败\n原因: {message}"
+                }
+            }
+            requests.post(WECOM_WEBHOOK, json=msg)
+
         sys.exit(0)
 
     # -------------------- 正常数据 --------------------
@@ -86,10 +87,12 @@ if __name__ == '__main__':
 
     print(result_text)
 
-    sendContent += result_text
-
-    # -------------------- 推送 --------------------
-    if PUSH_TOKEN:
-        requests.get(
-            f"http://www.pushplus.plus/send?token={PUSH_TOKEN}&title=GLADOS签到通知&content={sendContent}"
-        )
+    # -------------------- 企业微信推送 --------------------
+    if WECOM_WEBHOOK:
+        msg = {
+            "msgtype": "text",
+            "text": {
+                "content": f"GLADOS签到通知\n{result_text}"
+            }
+        }
+        requests.post(WECOM_WEBHOOK, json=msg)
