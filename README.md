@@ -1,5 +1,5 @@
 
-# Glados自动签到 （备份库）
+# Glados自动签到 - 已更换域名为glados.cloud
 
 ## 食用方式：
 
@@ -15,7 +15,7 @@
 
 1. 跳转至自己的仓库的`Settings`->`Secrets and variables`->`Action`
 
-2. 添加1个`repository secret`，命名为`COOKIES`，其值对应GLaDOS账号的cookie值中的有效部分（获取方式如下）
+2. 添加1个`repository secret`，命名为`GLADOS_COOKIE`，其值对应GLaDOS账号的cookie值中的有效部分（获取方式如下）
 
 - 在GLaDOS的签到页面按`F12`
 
@@ -42,10 +42,11 @@
 ## 文件结构
 
 ```shell
-│  checkin.py	# 签到脚本
+│  glados.py	# 签到脚本
 │
 ├─.github
 │  └─workflows
 │          gladosCheck.yml	# Actions 配置文件
 ```
+
 
