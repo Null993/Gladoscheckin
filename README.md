@@ -63,6 +63,13 @@ requests
 | `WECOM_WEBHOOK` | 否 | 企业微信群机器人的 Webhook 地址 |
 | `GLADOS_TIMEOUT` | 否 | 单次读取超时秒数，默认 `30`，范围 5～120 |
 | `GLADOS_RETRIES` | 否 | 首次请求失败后的重试次数，默认 `3`，范围 0～8 |
+| `EMAIL_SMTP_HOST` | 否 | 失败邮件的 SMTP 服务器，例如 `smtp.qq.com` |
+| `EMAIL_SMTP_PORT` | 否 | SMTP 端口，SSL 默认 `465`，STARTTLS 通常为 `587` |
+| `EMAIL_SMTP_USER` | 否 | SMTP 登录账号，通常是发件邮箱地址 |
+| `EMAIL_SMTP_PASSWORD` | 否 | 邮箱服务商生成的 SMTP 授权码，不是网页登录密码 |
+| `EMAIL_TO` | 否 | 收件邮箱；多个地址可用逗号、分号或换行分隔 |
+| `EMAIL_FROM` | 否 | 发件地址，默认与 `EMAIL_SMTP_USER` 相同 |
+| `EMAIL_SMTP_SECURITY` | 否 | `ssl`（默认）、`starttls` 或 `none` |
 
 多账号可把多个 Cookie 放进同一个 `GLADOS_COOKIE`，使用换行或 `&` 分隔。
 
@@ -80,6 +87,27 @@ koa:sess=...; koa:sess.sig=...
 ```
 
 Cookie 等同于登录凭证，请只保存在青龙环境变量中，不要写入脚本、日志或提交到 GitHub。
+
+### 失败邮件告警
+
+只要配置了邮件变量，账号签到失败、Cookie 缺失或未捕获的脚本运行异常都会触发邮件；签到成功时不会发送邮件。发送邮件只需要 SMTP，POP3/IMAP 是收取邮件的协议，无需配置。
+
+以 QQ 邮箱为例：
+
+```text
+EMAIL_SMTP_HOST=smtp.qq.com
+EMAIL_SMTP_PORT=465
+EMAIL_SMTP_USER=你的QQ邮箱
+EMAIL_SMTP_PASSWORD=QQ邮箱生成的SMTP授权码
+EMAIL_TO=接收告警的邮箱
+EMAIL_SMTP_SECURITY=ssl
+```
+
+163 邮箱可使用 `smtp.163.com:465`；其他邮箱请采用服务商提供的 SMTP 地址、端口和应用专用密码/授权码。所有邮件变量必须作为青龙环境变量保存，切勿提交到仓库。
+
+### 青龙任务名称异常
+
+青龙版脚本内置了 `GLaDOS 青龙签到` 任务名称和每天 09:30 的定时元数据，并避开了会被旧版青龙误解析为 `str, default` 的字段。如果错误任务已经存在，请删除该任务后重新运行一次订阅，或直接把任务名称手动改为 `GLaDOS 青龙签到`。
 
 ## 四、验证
 
