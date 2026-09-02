@@ -63,6 +63,8 @@ requests
 | `WECOM_WEBHOOK` | 否 | 企业微信群机器人的 Webhook 地址 |
 | `GLADOS_TIMEOUT` | 否 | 单次读取超时秒数，默认 `30`，范围 5～120 |
 | `GLADOS_RETRIES` | 否 | 首次请求失败后的重试次数，默认 `3`，范围 0～8 |
+| `GLADOS_SERVICE_RETRIES` | 否 | 服务端提示“稍后重试”后的额外重试次数，默认 `3` |
+| `GLADOS_SERVICE_RETRY_DELAY` | 否 | 服务端临时错误的首次等待秒数，默认 `30`，之后递增 |
 | `EMAIL_SMTP_HOST` | 否 | 失败邮件的 SMTP 服务器，例如 `smtp.qq.com` |
 | `EMAIL_SMTP_PORT` | 否 | SMTP 端口，SSL 默认 `465`，STARTTLS 通常为 `587` |
 | `EMAIL_SMTP_USER` | 否 | SMTP 登录账号，通常是发件邮箱地址 |
@@ -121,4 +123,12 @@ your@email.com ---- Checkin Successfully ---- 剩余 123 天
 
 ## 重试机制
 
-网络请求失败后，脚本会按 2、4、8 秒逐步等待并重试。默认配置下，原先的单次 15 秒请求已调整为最多 4 次、每次读取等待 30 秒。若 NAS 到 GLaDOS 的网络长期不稳定，可把 `GLADOS_TIMEOUT` 调到 `60`，或将 `GLADOS_RETRIES` 调到 `4`。
+网络请求失败后，脚本会按 2、4、8 秒逐步等待并重试。默认配置下，每轮网络请求最多尝试 4 次、每次读取等待 30 秒。
+
+如果接口正常返回、但提示 `Submarine cable data not ready. Please try again in a moment.` 等服务端临时错误，脚本会另外按 30、60、120 秒等待后再次发起签到；这组重试不会被前面的网络超时或 502 消耗。Cookie 失效等非临时错误不会反复重试。
+
+若 NAS 到 GLaDOS 的网络长期不稳定，可把 `GLADOS_TIMEOUT` 调到 `60`、`GLADOS_RETRIES` 调到 `4`；若 GLaDOS 服务本身经常短时不可用，可把 `GLADOS_SERVICE_RETRIES` 调到 `5`。
+
+## 青龙随机延迟
+
+青龙的 `RandomDelay` 是全局随机延迟配置，不是脚本自身行为。例如任务日志显示随机延迟 2639 秒，09:30 的任务实际要到 10:14 左右才开始。若不需要该行为，请在青龙配置文件中将 `RandomDelay` 的值置空（或按所用青龙版本设为 `0`），保存后重启相关调度服务；也可以保留它来错峰运行。

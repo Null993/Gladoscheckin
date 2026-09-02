@@ -27,6 +27,8 @@ CHECKIN_URL = "https://glados.rocks/api/user/checkin"
 STATUS_URL = "https://glados.rocks/api/user/status"
 DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
+DEFAULT_SERVICE_RETRIES = 3
+DEFAULT_SERVICE_RETRY_DELAY = 30
 
 
 def env_int(variable: str, default: int, minimum: int, maximum: int) -> int:
@@ -165,6 +167,64 @@ def is_already_checked_in(message: str) -> bool:
     )
 
 
+def is_temporary_service_error(message: str) -> bool:
+    """识别接口已响应、但服务端明确要求稍后重试的临时错误。"""
+    normalized = message.lower()
+    return any(
+        marker in normalized
+        for marker in (
+            "submarine cable data not ready",
+            "try again in a moment",
+            "try again later",
+            "temporarily unavailable",
+            "service unavailable",
+            "server busy",
+            "稍后再试",
+            "稍后重试",
+            "服务繁忙",
+            "服务暂不可用",
+        )
+    )
+
+
+def checkin_with_service_retry(
+    session: requests.Session,
+    headers: Dict[str, str],
+    account_no: int,
+    retries: int,
+    timeout: int,
+    service_retries: int,
+    service_retry_delay: int,
+) -> Dict[str, Any]:
+    """在网络重试之外，对 GLaDOS 的临时业务错误进行较长间隔重试。"""
+    attempts = service_retries + 1
+    for attempt in range(1, attempts + 1):
+        result = request_json(
+            session,
+            "POST",
+            CHECKIN_URL,
+            f"账号 {account_no} 签到请求",
+            headers=headers,
+            json={"token": "glados.cloud"},
+            retries=retries,
+            timeout=timeout,
+        )
+        message = str(result.get("message", "未知状态"))
+        if result.get("code") == 0 or is_already_checked_in(message):
+            return result
+        if not is_temporary_service_error(message) or attempt == attempts:
+            return result
+
+        wait_seconds = min(service_retry_delay * (2 ** (attempt - 1)), 300)
+        print(
+            f"账号 {account_no} 签到服务暂不可用（第 {attempt}/{attempts} 次）: "
+            f"{message}；{wait_seconds} 秒后重试"
+        )
+        time.sleep(wait_seconds)
+
+    return result
+
+
 def send_wecom(webhook: str, content: str, retries: int, timeout: int) -> None:
     if not webhook:
         return
@@ -191,7 +251,14 @@ def send_wecom(webhook: str, content: str, retries: int, timeout: int) -> None:
                 print(f"企业微信通知在 {attempts} 次尝试后仍失败: {exc}")
 
 
-def checkin_account(cookie: str, account_no: int, retries: int, timeout: int) -> str:
+def checkin_account(
+    cookie: str,
+    account_no: int,
+    retries: int,
+    timeout: int,
+    service_retries: int,
+    service_retry_delay: int,
+) -> str:
     headers = {
         "cookie": cookie,
         "referer": "https://glados.rocks/console/checkin",
@@ -204,15 +271,14 @@ def checkin_account(cookie: str, account_no: int, retries: int, timeout: int) ->
     }
 
     with requests.Session() as session:
-        checkin = request_json(
+        checkin = checkin_with_service_retry(
             session,
-            "POST",
-            CHECKIN_URL,
-            f"账号 {account_no} 签到请求",
-            headers=headers,
-            json={"token": "glados.cloud"},
-            retries=retries,
-            timeout=timeout,
+            headers,
+            account_no,
+            retries,
+            timeout,
+            service_retries,
+            service_retry_delay,
         )
         state = request_json(
             session,
@@ -249,6 +315,12 @@ def main() -> int:
     webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
     timeout = env_int("GLADOS_TIMEOUT", DEFAULT_TIMEOUT, 5, 120)
     retries = env_int("GLADOS_RETRIES", DEFAULT_RETRIES, 0, 8)
+    service_retries = env_int(
+        "GLADOS_SERVICE_RETRIES", DEFAULT_SERVICE_RETRIES, 0, 8
+    )
+    service_retry_delay = env_int(
+        "GLADOS_SERVICE_RETRY_DELAY", DEFAULT_SERVICE_RETRY_DELAY, 5, 600
+    )
 
     cookies = split_cookies(raw_cookies)
     if not cookies:
@@ -261,7 +333,14 @@ def main() -> int:
     failures: List[str] = []
     for account_no, cookie in enumerate(cookies, start=1):
         try:
-            result = checkin_account(cookie, account_no, retries, timeout)
+            result = checkin_account(
+                cookie,
+                account_no,
+                retries,
+                timeout,
+                service_retries,
+                service_retry_delay,
+            )
             print(result)
             results.append(result)
         except Exception as exc:  # 保证多账号中一个失败时仍继续执行其他账号。
