@@ -13,7 +13,13 @@
 
 参考 [issue #28](https://github.com/lankerr/2026-glados-checkin/issues/28)、[PR #31](https://github.com/lankerr/2026-glados-checkin/pull/31) 和 [PR #33](https://github.com/lankerr/2026-glados-checkin/pull/33)（核对版本 `8649193124403fb0195c66a6e4be8b7d2103b96b`）：官网已增加一次性 challenge。旧脚本只提交 token，缺少这一流程。感谢原项目维护者及 chengchang1987-cloud 的排查。
 
-青龙版现在先在 `glados.rocks` 获取 challenge，等待 2.7 秒后在同一域名提交 nonce、SHA-256 proof 和域名 token。验证不可用或格式异常时停止；验证过期、网络异常或服务临时错误需要重试时，重新获取验证，不复用旧 nonce，也不回退到仅提交 token 的旧流程。无需安装浏览器或手动处理验证码，Python 依赖仍只有 `requests`。
+青龙版现在先在 `glados.rocks` 获取 challenge，等待 2.7 秒后在同一域名提交 nonce、SHA-256 proof 和域名 token。验证不可用或格式异常时停止；验证过期、网络异常或服务临时错误需要重试时，重新获取验证，不复用旧 nonce，也不回退到仅提交 token 的旧流程。Python 依赖仍只有 `requests`，但无法处理官网要求的浏览器 Turnstile 验证，详见下文。
+
+**2026-11-11 补充核对官网前端：**当前签到流程还读取 challenge 返回的 `turnstile` 配置，通过 Cloudflare Turnstile 获取令牌，并提交 `tsState` 及验证令牌。SHA-256 算法未变。11 月 6 日参考版本没有覆盖这部分，不能据此前修复保证当前所有账号自动签到可用。
+
+版本 `2026-11-11.2` 在 challenge 未要求 Turnstile 时按官网提交 `tsState: off`；如果返回有效的 Turnstile 配置，停止提交并提示到官网完成签到，不伪造状态或复用其他请求的验证令牌。如果服务端仍返回 `Automated check-in detected. Please sign in again to continue.`，仅能确定当前请求被拒绝，无法仅凭该文字断定是 Cookie、请求头、网络或其他校验造成。浏览器手动成功也不代表纯 HTTP 脚本可用；换 User-Agent 不能替代浏览器验证。
+
+启动日志会显示版本号、是否读取 `GLADOS_USER_AGENT`，以及本次 challenge 是否要求 Turnstile，不输出 Cookie、nonce、proof 或令牌。若最新版仍无法自动签到，需要使用官网完成签到；此版本未实现浏览器运行模式。
 
 已有青龙用户更新步骤：
 

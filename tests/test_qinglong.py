@@ -54,6 +54,7 @@ class CheckinTests(unittest.TestCase):
         self.assertEqual(post_call.kwargs["json"], {
             "token": "glados.rocks", "nonce": "test-nonce",
             "proof": hashlib.sha256(b"test-nonce.glados-observe-v1").hexdigest(),
+            "tsState": "off",
         })
         self.assertEqual(get_call.kwargs["headers"], post_call.kwargs["headers"])
         self.assertFalse(post_call.kwargs["allow_redirects"])
@@ -80,6 +81,18 @@ class CheckinTests(unittest.TestCase):
         with self.assertRaisesRegex(glados.RetryableRequestError, "已过期"):
             self.run_checkin(retries=0)
         self.assertEqual(self.session.request.call_count, 1)
+
+    def test_turnstile_requirement_stops_before_post(self):
+        self.session.request.return_value = challenge(turnstile={"sitekey": "public-site-key"})
+        with self.assertRaisesRegex(RuntimeError, "Turnstile"):
+            self.run_checkin()
+        self.assertEqual(self.session.request.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_explicitly_disabled_turnstile_uses_off_state(self):
+        self.session.request.side_effect = [challenge(turnstile=None), response({"code": 0})]
+        self.run_checkin()
+        self.assertEqual(self.session.request.call_args.kwargs["json"]["tsState"], "off")
 
     def test_post_network_errors_get_new_nonce(self):
         failures = [

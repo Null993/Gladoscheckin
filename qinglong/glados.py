@@ -38,6 +38,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
+SCRIPT_VERSION = "2026-11-11.2"
 
 
 class RetryableRequestError(RuntimeError):
@@ -251,6 +252,14 @@ def verified_checkin(
         or ttl <= CHALLENGE_DELAY * 1000
     ):
         raise RuntimeError("签到 challenge 不可用或格式无效；已停止，未提交旧版签到")
+    # 当前官网会在需要时返回 Turnstile 配置；令牌由浏览器组件生成，
+    # 不能用固定字符串、旧令牌或伪造 off 状态替代。
+    if challenge.get("turnstile"):
+        raise RuntimeError(
+            "本次签到要求 Cloudflare Turnstile 浏览器验证，纯 requests 脚本无法完成；"
+            "已停止提交，请在官网完成签到。更换 User-Agent 不能替代此验证"
+        )
+    print(f"账号 {account_no} challenge 未要求 Turnstile 浏览器验证", flush=True)
     proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()
     print(f"账号 {account_no} 已获取签到验证，等待 {CHALLENGE_DELAY} 秒", flush=True)
     time.sleep(CHALLENGE_DELAY)
@@ -259,7 +268,9 @@ def verified_checkin(
     # POST 失败不可重放同一 nonce；外层网络重试重新获取验证。
     return request_json(
         session, "POST", CHECKIN_URL, f"账号 {account_no} 签到请求",
-        headers=headers, json={"token": "glados.rocks", "nonce": nonce, "proof": proof},
+        headers=headers, json={
+            "token": "glados.rocks", "nonce": nonce, "proof": proof, "tsState": "off",
+        },
         retries=0, timeout=timeout,
     )
 
@@ -404,6 +415,13 @@ def checkin_account(
     message = str(checkin.get("message", "未知状态"))
     successful = is_successful_checkin(checkin)
     if not successful:
+        if "automated check-in detected" in message.lower():
+            raise RuntimeError(
+                "服务端拒绝自动签到（Automated check-in detected）；"
+                "challenge 已提交，但服务器仍未接受当前请求。"
+                "若重新登录且使用实际 User-Agent 后仍失败，请使用官网签到；"
+                "脚本不会通过重复请求绕过验证"
+            )
         raise RuntimeError(f"签到接口返回失败: {message}")
 
     return f"{email} ---- {message} ---- 剩余 {left_days} 天"
@@ -412,6 +430,14 @@ def checkin_account(
 def main() -> int:
     if requests is None:
         raise RuntimeError(f"requests 依赖导入失败: {REQUESTS_IMPORT_ERROR}")
+
+    print(f"GLaDOS 青龙签到版本 {SCRIPT_VERSION}", flush=True)
+    print(
+        "User-Agent: " + (
+            "已读取 GLADOS_USER_AGENT" if os.environ.get("GLADOS_USER_AGENT", "").strip()
+            else "未配置，使用默认值"
+        ), flush=True,
+    )
 
     raw_cookies = os.environ.get("GLADOS_COOKIE", "").strip()
     webhook = os.environ.get("WECOM_WEBHOOK", "").strip()
