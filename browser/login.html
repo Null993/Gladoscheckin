@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GLaDOS NAS 登录</title>
+<style>
+body{font:16px/1.7 system-ui,sans-serif;background:#f6f6f3;color:#252a26;max-width:780px;margin:40px auto;padding:0 22px}
+h1{font-size:28px}main{background:white;border:1px solid #dce2dc;border-radius:14px;padding:24px}
+button,a.action{font:inherit;border:0;border-radius:8px;background:#24563d;color:white;padding:10px 16px;cursor:pointer;text-decoration:none;display:inline-block;margin:8px 8px 8px 0}
+input{font:inherit;width:60px;padding:6px}#status{white-space:pre-wrap;background:#eff3ef;border-radius:8px;padding:16px}small{color:#5a635e}button:disabled{opacity:.5;cursor:wait}
+</style>
+<h1>在 NAS 浏览器中登录 GLaDOS</h1>
+<main>
+<p>首次在这里登录，后续青龙会复用同一个 Linux 浏览器会话。此页面不接收你的 GLaDOS 密码或 Cookie。</p>
+<label>账号编号 <input id="profile" type="number" min="1" max="20" value="1"></label>
+<p><button id="start">1. 启动登录浏览器</button><a class="action" id="desktop" target="_blank" rel="noopener">2. 打开远程浏览器</a></p>
+<p>远程桌面要求输入你设置的 <code>GLADOS_VNC_PASSWORD</code>。浏览器启动可能需要约 2–3 分钟。进入 GLaDOS 官网后完成登录，确认能看到账号页，再回来保存。</p>
+<button id="finish">3. 保存登录并关闭浏览器</button>
+<p id="status" role="status">尚未启动登录。</p>
+<small>一次只登录一个账号，最长保留 15 分钟。保存期间不要再点击签到；登录操作本身不会自动签到。多账号请逐个选择编号登录。</small>
+</main>
+<script>
+const statusBox=document.getElementById('status'), start=document.getElementById('start');
+const desktop=new URL(location.href); desktop.port='8094'; desktop.pathname='/vnc.html'; desktop.search='autoconnect=true&resize=scale';
+document.getElementById('desktop').href=desktop.href;
+const stages={start_browser:'正在启动浏览器，请稍候',manual_login:'浏览器已打开，等待你登录并点击保存',manual_login_incomplete:'尚未确认登录，请在远程浏览器完成登录后再次保存',login_saved:'登录已保存',open_checkin_page_uc_open:'正在打开官网',open_checkin_page_reconnect:'正在连接浏览器'};
+async function post(path,body={}){
+ const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Glados-UI':'1'},body:JSON.stringify(body)});
+ const d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d;
+}
+start.onclick=async()=>{try{await post('/login/start',{profile_id:Number(document.getElementById('profile').value)});statusBox.textContent='正在启动登录浏览器…';}catch(e){statusBox.textContent=e.message==='busy'?'另一个任务正在运行，请等待结束':e.message;}};
+document.getElementById('finish').onclick=async()=>{try{await post('/login/finish');statusBox.textContent='正在确认登录并保存，请稍候…';}catch(e){statusBox.textContent=e.message;}};
+async function poll(){try{
+ const r=await fetch('/login/status',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();
+ start.disabled=d.running;
+ if(d.running){statusBox.textContent='账号 '+d.profile_id+'：'+(stages[d.stage]||'处理中，请稍候');}
+ else if(d.result){statusBox.textContent=d.result.login_saved?'账号 '+d.profile_id+' 登录已保存。可以在青龙启用 profile 会话模式并运行签到。':'登录未保存：'+(d.result.error||'browser_error')+' '+(d.result.stage||'')+' '+(d.result.diagnostic||'');}
+}catch(e){statusBox.textContent='服务连接中断，请检查容器状态';}}
+setInterval(poll,2000);poll();
+</script></html>

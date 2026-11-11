@@ -39,7 +39,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
-SCRIPT_VERSION = "2026-11-11.5"
+SCRIPT_VERSION = "2026-11-11.6"
 
 
 class RetryableRequestError(RuntimeError):
@@ -431,6 +431,10 @@ def checkin_account(
 
 
 def browser_service_request(cookie: str, account_no: int, selftest: bool = False) -> Dict[str, Any]:
+    session_mode = os.environ.get("GLADOS_BROWSER_SESSION", "cookie").strip().lower()
+    if session_mode not in ("cookie", "profile"):
+        raise RuntimeError("GLADOS_BROWSER_SESSION 仅支持 cookie 或 profile")
+    profile_mode = session_mode == "profile" and not selftest
     base_url = os.environ.get("GLADOS_BROWSER_URL", "").strip().rstrip("/")
     token = os.environ.get("GLADOS_BROWSER_TOKEN", "").strip()
     parsed = urlsplit(base_url)
@@ -440,7 +444,7 @@ def browser_service_request(cookie: str, account_no: int, selftest: bool = False
         raise RuntimeError("GLADOS_BROWSER_URL 只能包含协议、主机和端口")
     if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
         raise RuntimeError("GLADOS_BROWSER_TOKEN 至少需要 32 个无空格 ASCII 字符，并与浏览器容器一致")
-    timeout = env_int("GLADOS_BROWSER_TIMEOUT", 180, 60, 300)
+    timeout = env_int("GLADOS_BROWSER_TIMEOUT", 420 if profile_mode else 180, 60, 600)
     print(
         f"浏览器环境自检（最长 {timeout} 秒，不访问 GLaDOS）" if selftest else
         f"账号 {account_no} 使用 NAS 浏览器签到（最长 {timeout} 秒）", flush=True,
@@ -453,8 +457,10 @@ def browser_service_request(cookie: str, account_no: int, selftest: bool = False
                 base_url + ("/selftest" if selftest else "/checkin"),
                 headers={"Authorization": "Bearer " + token},
                 json={
-                    "cookie": cookie, "timeout": timeout,
-                    "user_agent": browser_user_agent() if os.environ.get("GLADOS_USER_AGENT", "").strip() else None,
+                    "cookie": "" if profile_mode else cookie, "timeout": timeout,
+                    "session_mode": "profile" if profile_mode else "cookie",
+                    "profile_id": account_no if profile_mode else 1,
+                    "user_agent": browser_user_agent() if not profile_mode and os.environ.get("GLADOS_USER_AGENT", "").strip() else None,
                 },
                 timeout=(10, timeout + 20), allow_redirects=False,
             )
@@ -480,6 +486,10 @@ def browser_service_request(cookie: str, account_no: int, selftest: bool = False
             "timeout": "浏览器任务超时，签到状态未知，请先核对官网流水",
             "browser_error": "浏览器执行失败，请查看容器是否正常及 Chrome 是否安装完整",
             "invalid_cookie": "Cookie 格式无效，请复制完整 Cookie 值",
+            "profile_not_ready": "NAS 浏览器会话未保存，请先在 8093 登录页完成对应账号登录并保存",
+            "profile_origin_mismatch": "保存会话的域名与 GLADOS_ORIGIN 不一致，请保持原域名或在当前域名重新登录保存",
+            "button_not_found": "未找到官网签到按钮，请核对登录状态或页面结构",
+            "button_disabled": "官网签到按钮处于禁用状态，请核对页面上的实际提示",
         }
         message = reasons.get(result.get("error"), "浏览器服务执行失败")
         details = []
@@ -504,6 +514,15 @@ def browser_checkin_account(cookie: str, account_no: int) -> str:
     if not isinstance(checkin, dict) or not isinstance(state, dict):
         raise RuntimeError("浏览器服务缺少签到或状态结果")
     if not is_successful_checkin(checkin):
+        if checkin.get("reason") == "device-mismatch":
+            devices = ("Windows", "Linux", "Mac OS", "macOS", "Android", "iOS")
+            logged = checkin.get("loginDevice")
+            current = checkin.get("currentDevice")
+            raise RuntimeError(
+                f"签到设备不匹配：登录设备={logged if logged in devices else '未知'}，"
+                f"当前浏览器={current if current in devices else '未知'}。"
+                "请在 NAS 的 8093 登录页用同一 Linux 浏览器重新登录并保存，使用 profile 模式"
+            )
         if is_auth_failure(checkin):
             raise RuntimeError("官网拒绝浏览器会话认证/设备验证，请在官网核对登录状态")
         raise RuntimeError(f"浏览器签到失败: {checkin.get('message', '未知错误')}")
@@ -525,8 +544,10 @@ def main() -> int:
     if mode not in ("http", "browser"):
         raise RuntimeError("GLADOS_MODE 仅支持 http 或 browser")
     print(f"签到模式: {mode}", flush=True)
+    profile_mode = mode == "browser" and os.environ.get("GLADOS_BROWSER_SESSION", "cookie").strip().lower() == "profile"
     print(
         "User-Agent: " + (
+            "profile 模式使用 NAS 浏览器原生身份，忽略自定义值" if profile_mode else
             "已读取 GLADOS_USER_AGENT" if os.environ.get("GLADOS_USER_AGENT", "").strip()
             else ("未配置，使用浏览器原生值" if mode == "browser" else "未配置，使用默认值")
         ), flush=True,
@@ -555,15 +576,24 @@ def main() -> int:
     )
 
     cookies = split_cookies(raw_cookies)
-    if not cookies:
+    if not cookies and not profile_mode:
         failure = "未获取到 GLADOS_COOKIE，请先在青龙面板中添加该环境变量"
         print(failure)
         send_failure_email("GLaDOS 签到失败", failure)
         return 1
 
+    if profile_mode:
+        raw_profiles = os.environ.get("GLADOS_BROWSER_PROFILES", "1").strip()
+        parts = re.split(r"[,;\s]+", raw_profiles)
+        if not parts or any(not part.isascii() or not part.isdigit() or not 1 <= int(part) <= 20 for part in parts):
+            raise RuntimeError("GLADOS_BROWSER_PROFILES 请填写 1～20 的账号编号，多个用逗号分隔")
+        accounts = [(profile_id, "") for profile_id in dict.fromkeys(int(part) for part in parts)]
+    else:
+        accounts = list(enumerate(cookies, start=1))
+
     results: List[str] = []
     failures: List[str] = []
-    for account_no, cookie in enumerate(cookies, start=1):
+    for account_no, cookie in accounts:
         try:
             result = checkin_account(
                 cookie,

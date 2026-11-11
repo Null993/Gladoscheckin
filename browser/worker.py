@@ -3,14 +3,131 @@ import contextlib
 import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
 import traceback
 from pathlib import Path
+from urllib.parse import urlsplit
 
-ORIGIN = "https://glados.rocks"
+# 会话只用于明确配置的 HTTPS 站点；profile 模式还核对保存时的域名。
+def configured_origin():
+    value = (os.environ.get("GLADOS_ORIGIN") or "https://glados.rocks").strip().rstrip("/")
+    if "://" not in value:
+        value = "https://" + value
+    url = urlsplit(value)
+    if (url.scheme != "https" or url.hostname not in ("glados.rocks", "glados.one", "glados.cloud")
+            or url.port not in (None, 443) or url.username or url.password
+            or url.path or url.query or url.fragment):
+        raise ValueError("GLADOS_ORIGIN must be a supported HTTPS GLaDOS origin")
+    return "https://" + url.hostname
+
+
+ORIGIN = configured_origin()
 RESULT_MARKER = "GLADOS_RESULT:"
+# 阶段落盘：server.py 在硬超时 SIGKILL 时读这个文件，才知道 worker 死在哪一步。
+STAGE_FILE = os.environ.get("GLADOS_STAGE_FILE", str(Path(tempfile.gettempdir()) / "glados-stage"))
+PROFILE_ROOT = Path(os.environ.get("GLADOS_PROFILE_ROOT", "/data/profiles"))
+
+
+def profile_path(profile_id):
+    if type(profile_id) is not int or not 1 <= profile_id <= 20:
+        raise ValueError("invalid_profile")
+    return PROFILE_ROOT / str(profile_id)
+
+
+def saved_profile_origin(path):
+    try:
+        return json.loads((path / "session.json").read_text(encoding="utf-8")).get("origin")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+@contextlib.contextmanager
+def running_browser(factory, options, persistent):
+    with factory(**options) as browser:
+        try:
+            yield browser
+        finally:
+            if persistent:
+                # UC.quit() terminates Chrome directly (TerminateProcess on
+                # Windows). Ask Chrome to flush its own profile first instead.
+                try:
+                    browser.driver.execute_cdp_cmd("Browser.close", {})
+                except Exception:
+                    pass  # Closing the browser may also close the CDP socket.
+                pid = getattr(browser.driver, "browser_pid", None)
+                if type(pid) is int:
+                    try:
+                        import psutil
+                        psutil.Process(pid).wait(timeout=10)
+                    except Exception:
+                        pass
+
+
+@contextlib.contextmanager
+def browser_profile(job):
+    if job.get("operation") != "selftest" and (job.get("session_mode") == "profile" or job.get("operation") == "login"):
+        path = profile_path(job.get("profile_id", 1))
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        yield str(path)
+    else:
+        with tempfile.TemporaryDirectory(prefix="glados-profile-") as path:
+            yield path
+
+# 减少 Chromium 无关后台联网。NAS 约 136 秒的启动耗时在添加这些参数后
+# 仍存在，尚不能据此归因于组件更新或认定已解决。
+# SeleniumBase 的 chromium_arg 支持逗号分隔多个参数。
+CHROME_ARGS = ",".join([
+    "--no-sandbox",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-networking",
+    "--disable-component-update",
+    "--disable-domain-reliability",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--disable-client-side-phishing-detection",
+    "--metrics-recording-only",
+    # 注意：不能写成 --disable-features=A,B —— SeleniumBase 用逗号分隔参数，
+    # 值里带逗号会被拆成多个非法参数。只保留单个特性。
+    "--disable-features=Translate",
+])
+
+
+def mark(progress, stage):
+    """记录当前阶段。落盘是唯一能在 SIGKILL 后存活的通道。"""
+    progress["stage"] = stage
+    try:
+        Path(STAGE_FILE).write_text(stage, encoding="ascii")
+    except OSError:
+        pass
+
+
+class StageTimeout(Exception):
+    """某个阻塞的浏览器调用超时。由 SIGALRM 打断，仅在 Linux 容器内生效。"""
+
+
+def _raise_stage_timeout(signum, frame):
+    raise StageTimeout()
+
+
+@contextlib.contextmanager
+def watchdog(seconds):
+    """给一段阻塞调用加硬超时。Selenium 的调用无法被 socket 超时打断，
+    但 SIGALRM 可以，它会在调用返回前把异常抛进主线程。"""
+    if not hasattr(signal, "SIGALRM"):  # Windows 上不存在，直接放行
+        yield
+        return
+    previous = signal.signal(signal.SIGALRM, _raise_stage_timeout)
+    signal.setitimer(signal.ITIMER_REAL, max(5, int(seconds)))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
 
 # Observe only the actual official-page POST response. No requests are synthesized.
 OBSERVER = r"""(() => {
@@ -24,6 +141,7 @@ OBSERVER = r"""(() => {
         window.__gladosCheckinResult = {
           code: d.code, message: String(d.message || '').slice(0, 1000),
           reason: String(d.reason || '').slice(0, 100), repeated: d.repeated === true
+          ,loginDevice: String(d.loginDevice || '').slice(0, 40), currentDevice: String(d.currentDevice || '').slice(0, 40)
         };
       }
     } catch (_) {}
@@ -50,6 +168,37 @@ OBSERVER = r"""(() => {
     return response;
   };
 })();
+"""
+
+# 页面是否已经加载了 Cloudflare Turnstile。
+# 不能用 querySelector 查 iframe：Turnstile 组件渲染在 closed shadow DOM 里，
+# document.querySelectorAll('iframe') 看不到它（实测资源有加载、DOM 查询为空）。
+# 资源加载记录（Resource Timing）能穿透 shadow DOM，是可靠信号。
+CF_PRESENT_JS = r"""
+const res = performance.getEntriesByType('resource') || [];
+return res.some(e => String(e.name).indexOf('challenges.cloudflare.com') >= 0);
+"""
+
+# 判断并点击签到按钮。返回 'clicked' / 'hidden' / 'missing'。
+# 不用 sb.is_element_visible + sb.click：前者会把带 :not([disabled]) 的 CSS 选择器
+# 误判成链接文本而永远返回 False；后者依赖真实鼠标位置，被遮罩挡住就失败。
+CLICK_JS = r"""
+const pick = () => {
+  const direct = document.querySelector('button.ckb:not([disabled])');
+  if (direct) return direct;
+  return Array.from(document.querySelectorAll('button'))
+    .find(b => !b.disabled && /^\s*check\s*-?\s*in\s*$/i.test((b.innerText || '').trim())) || null;
+};
+const btn = pick();
+if (!btn) return 'missing';
+const rect = btn.getBoundingClientRect();
+const style = window.getComputedStyle(btn);
+if (!(rect.width > 0 && rect.height > 0) || style.display === 'none' || style.visibility === 'hidden') {
+  return 'hidden';
+}
+try { btn.scrollIntoView({ block: 'center' }); } catch (_) {}
+btn.click();
+return 'clicked';
 """
 
 STATUS_QUERY = """
@@ -82,91 +231,180 @@ def parse_cookies(raw):
 
 def run_browser(job, progress=None):
     progress = progress if progress is not None else {}
-    progress["stage"] = "parse_input"
+    mark(progress, "parse_input")
     selftest = job.get("operation") == "selftest"
+    login = job.get("operation") == "login"
+    persistent = not selftest and (login or job.get("session_mode") == "profile")
     cookies = {}
-    if not selftest:
+    if not selftest and not persistent:
         try:
             cookies = parse_cookies(job.get("cookie"))
         except ValueError:
-            return {"ok": False, "error": "invalid_cookie"}
+            return {"ok": False, "error": "invalid_cookie", "stage": progress["stage"]}
+    if persistent and not login:
+        path = profile_path(job.get("profile_id", 1))
+        origin = saved_profile_origin(path)
+        if origin is None:
+            return {"ok": False, "error": "profile_not_ready", "stage": progress["stage"]}
+        if origin != ORIGIN:
+            return {"ok": False, "error": "profile_origin_mismatch", "stage": progress["stage"]}
     if sys.platform.startswith("linux"):
-        progress["stage"] = "import_tkinter"
+        mark(progress, "import_tkinter")
         import tkinter  # Verify the same interpreter before MouseInfo can exit.
-    progress["stage"] = "import_seleniumbase"
+    mark(progress, "import_seleniumbase")
     from seleniumbase import SB
 
-    budget = max(60, min(int(job.get("timeout", 180)), 300))
+    # 内部预算必须比 server.py 的硬杀超时小一截，否则循环到点退出后还要执行
+    # SB 的 teardown（关 Chrome 需数秒），期间 worker 已被 SIGKILL，
+    # 真实 stage 永远回不到日志里，只剩一行裸的 "failed"。
+    requested = int(job.get("timeout", 180))
+    budget = max(30, min(requested - 25, 875 if login else 575))
     deadline = time.monotonic() + budget
     options = {
-        "uc": True, "headless": False, "locale": "en",
-        "xvfb": sys.platform.startswith("linux"), "chromium_arg": "--no-sandbox",
+        "uc": True, "headless": False, "headed": True, "locale": "en",
+        "xvfb": sys.platform.startswith("linux") and not os.environ.get("DISPLAY"), "chromium_arg": CHROME_ARGS,
         "driver_version": "keep", "no_screenshot": True,
+        "window_size": "1280,850",
     }
     if os.environ.get("CHROME_BINARY"):
         options["binary_location"] = os.environ["CHROME_BINARY"]
-    if job.get("user_agent"):
+    if job.get("user_agent") and not persistent:
         options["agent"] = job["user_agent"]
-    with tempfile.TemporaryDirectory(prefix="glados-profile-") as profile:
+    # Chrome must receive its proxy explicitly. HTTP_PROXY environment variables
+    # alone are not a reliable Chromium proxy configuration.
+    proxy = os.environ.get("GLADOS_BROWSER_PROXY", "").strip()
+    if proxy:
+        options["proxy"] = proxy
+    with browser_profile(job) as profile:
         options["user_data_dir"] = profile
-        progress["stage"] = "start_browser"
-        with SB(**options) as sb:
-            progress["stage"] = "configure_browser"
+        mark(progress, "start_browser")
+        with running_browser(SB, options, persistent) as sb:
+            mark(progress, "configure_browser")
             sb.driver.set_page_load_timeout(40)
             sb.driver.set_script_timeout(20)
+            if not selftest and time.monotonic() >= deadline:
+                return {"ok": False, "error": "timeout", "stage": progress["stage"]}
             if selftest:
-                progress["stage"] = "selftest_page"
+                mark(progress, "selftest_page")
                 sb.open("data:text/html,<html><title>GLaDOS browser self-test</title></html>")
                 value = sb.execute_script("return 21 * 2")
                 if value != 42:
                     raise RuntimeError("browser_javascript_failed")
                 if sys.platform.startswith("linux"):
-                    progress["stage"] = "selftest_display"
+                    mark(progress, "selftest_display")
                     import pyautogui
                     pyautogui.size()
                 return {"ok": True, "selftest": True, "stage": "complete"}
-            progress["stage"] = "inject_cookies"
+            mark(progress, "inject_cookies" if not persistent else "load_saved_session")
             # Set host-scoped cookies before opening the app, so login and
             # challenge requests all run in the same browser, UA and egress.
-            sb.driver.execute_cdp_cmd("Network.setCookies", {"cookies": [
-                {"name": name, "value": value, "url": ORIGIN + "/", "path": "/", "secure": True}
-                for name, value in cookies.items()
-            ]})
-            progress["stage"] = "open_checkin_page"
-            sb.uc_open_with_reconnect(ORIGIN + "/console/checkin", reconnect_time=3)
+            if cookies:
+                sb.driver.execute_cdp_cmd("Network.setCookies", {"cookies": [
+                    {"name": name, "value": value, "url": ORIGIN + "/", "path": "/", "secure": True}
+                    for name, value in cookies.items()
+                ]})
+            mark(progress, "open_checkin_page")
+            page_url = ORIGIN + "/console/checkin"
+            # uc_open_with_reconnect = uc_open + reconnect。拆成两步并各自打点，
+            # 才能知道是"打开页面"卡住还是"CDP 重连"卡住。
+            # watchdog 把这一步的等待上限压到 open_budget，超时立刻带 stage 报错，
+            # 不必再空等满 timeout。
+            open_budget = max(30, min(budget - 30, 90))
+            with watchdog(open_budget):
+                if hasattr(sb, "uc_open") and hasattr(sb, "reconnect"):
+                    mark(progress, "open_checkin_page_uc_open")
+                    sb.uc_open(page_url)
+                    mark(progress, "open_checkin_page_reconnect")
+                    sb.reconnect(3)
+                else:  # 旧版 SeleniumBase 没有拆开的接口
+                    sb.uc_open_with_reconnect(page_url, reconnect_time=3)
+            mark(progress, "open_checkin_page_done")
+            if login:
+                # The user logs in through noVNC. Never inject desktop cookies,
+                # submit credentials, click check-in, or export browser cookies.
+                mark(progress, "manual_login")
+                finish = Path(job["finish_file"])
+                while time.monotonic() < deadline:
+                    if finish.exists():
+                        finish.unlink(missing_ok=True)
+                        if urlsplit(sb.driver.current_url).netloc != urlsplit(ORIGIN).netloc:
+                            continue
+                        state = sb.driver.execute_async_script(STATUS_QUERY)
+                        if not isinstance(state, dict) or state.get("code") != 0 or not isinstance(state.get("data"), dict) or "leftDays" not in state["data"]:
+                            mark(progress, "manual_login_incomplete")
+                            continue
+                        marker = Path(profile) / "session.json"
+                        marker.write_text(json.dumps({"origin": ORIGIN}), encoding="utf-8")
+                        marker.chmod(0o600)
+                        mark(progress, "login_saved")
+                        return {"ok": True, "login_saved": True, "profile_id": job["profile_id"], "stage": "login_saved"}
+                    time.sleep(0.5)
+                return {"ok": False, "error": "login_timeout", "stage": progress["stage"]}
             # UC opens a new tab. Install observation on that tab before the
             # first click, rather than attaching it to the old blank target.
             sb.execute_script(OBSERVER)
-            progress["stage"] = "wait_checkin_page"
+            mark(progress, "wait_checkin_page")
             clicked = False
+            captcha_tried = False
             last_gui_attempt = 0.0
             while time.monotonic() < deadline:
                 current = sb.driver.current_url
                 if current.startswith(ORIGIN + "/authenticate") or current.startswith(ORIGIN + "/login"):
-                    return {"ok": False, "error": "login_required"}
+                    mark(progress, "login_redirect")
+                    return {"ok": False, "error": "login_required", "stage": progress["stage"]}
                 if not current.startswith(ORIGIN + "/"):
-                    return {"ok": False, "error": "login_required"}
+                    mark(progress, "offsite_redirect")
+                    return {"ok": False, "error": "login_required", "stage": progress["stage"]}
                 result = sb.execute_script("return window.__gladosCheckinResult || null")
                 if result:
-                    progress["stage"] = "read_status"
+                    mark(progress, "read_status")
                     state = sb.driver.execute_async_script(STATUS_QUERY)
-                    return {"ok": True, "checkin": result, "state": state}
-                # Reference project uses UC + a real display for optional
-                # Turnstile interaction. Let the official component own its
-                # nonce, callback, token and final POST throughout.
-                if time.monotonic() - last_gui_attempt >= 5:
+                    return {"ok": True, "checkin": result, "state": state, "stage": progress["stage"]}
+                # 只在「已点击」之后才处理挑战：Turnstile 是点击时才开始要 token 的，
+                # 提前用 pyautogui 在屏幕上点会误触页面里其他按钮（该页有 13 个）。
+                if clicked and time.monotonic() - last_gui_attempt >= 4:
                     last_gui_attempt = time.monotonic()
                     try:
-                        sb.uc_gui_click_captcha()
+                        if sb.execute_script(CF_PRESENT_JS):
+                            if not captcha_tried:
+                                mark(progress, "solve_captcha")
+                                captcha_tried = True
+                            # SeleniumBase 不同版本方法名不同，取存在的那个。
+                            clicker = (getattr(sb, "uc_gui_click_captcha", None)
+                                        or getattr(sb, "uc_gui_click_cf", None))
+                            if clicker is not None:
+                                clicker()
                     except Exception:
                         pass
-                if not clicked and sb.is_element_visible("button.ckb:not([disabled])"):
-                    progress["stage"] = "click_checkin"
-                    sb.click("button.ckb:not([disabled])")
-                    clicked = True  # Never click again, including on errors.
-                    progress["stage"] = "wait_checkin_response"
+                if not clicked:
+                    # 不用 sb.is_element_visible / sb.click：
+                    # 带 :not([disabled]) 伪类的 CSS 选择器会被 SeleniumBase 误判成
+                    # 链接文本，导致永远返回 False（实测按钮可点却一次没点到）；
+                    # 原生点击还可能被遮罩挡住。改成在页面里直接判断并 click()。
+                    state = sb.execute_script(CLICK_JS)
+                    if state == "clicked":
+                        mark(progress, "click_checkin")
+                        clicked = True  # Never click again, including on errors.
+                        mark(progress, "wait_checkin_response")
                 time.sleep(0.5)
-            return {"ok": False, "error": "verification_required" if clicked else "page_changed"}
+            # 循环结束仍未点到按钮时，区分三种原因——它们的修法完全不同：
+            #   button_not_found  页面改版，选择器失效
+            #   button_disabled   按钮存在但禁用（今日已签 / 挑战未过）
+            #   page_changed      按钮存在且可点，但一直没点到（罕见）
+            if not clicked:
+                try:
+                    ui = sb.execute_script(
+                        "const b = document.querySelector('button.ckb');"
+                        "return {has: !!b, disabled: b ? !!b.disabled : null};"
+                    ) or {}
+                except Exception:
+                    ui = {}
+                if not ui.get("has"):
+                    return {"ok": False, "error": "button_not_found", "stage": progress["stage"]}
+                if ui.get("disabled"):
+                    return {"ok": False, "error": "button_disabled", "stage": progress["stage"]}
+            return {"ok": False, "error": "verification_required" if clicked else "page_changed",
+                    "stage": progress["stage"]}
 
 
 def classify_exception(exc):
@@ -200,7 +438,8 @@ def main():
         location = frames[-1] if frames else None
         result = {
             "ok": False, "error": "browser_error", "diagnostic": type(exc).__name__,
-            "stage": progress["stage"], "category": classify_exception(exc),
+            "stage": progress["stage"],
+            "category": "stage_timeout" if isinstance(exc, StageTimeout) else classify_exception(exc),
         }
         if location:
             result["diagnostic_file"] = Path(location.filename).name

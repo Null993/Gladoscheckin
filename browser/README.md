@@ -1,14 +1,22 @@
-# 绿联 DXP4800 / Intel N100：青龙调用浏览器签到
+# DXP4800 / N100：在 NAS 登录，再由青龙签到
 
-适用：x86_64 NAS、Docker 部署青龙。浏览器放在独立容器，青龙仍运行仓库里的 `qinglong/glados.py`，Python 依赖仍只有 `requests`。代码由仓库订阅更新，以下只需部署容器和填写环境变量。
+版本 `2026-11-11.6`。针对 `device-mismatch / loginDevice=Windows / currentDevice=Linux`，新增 NAS 原生浏览器登录和持久会话。首次在 NAS 的 Linux Chromium 中登录，后续青龙复用同一个浏览器配置，不再注入 Windows Cookie。
 
-此模式让 Chromium 打开官网，在同一浏览器里运行官网 challenge / Turnstile、点击签到并读取实际接口结果；不把获取 `cf_clearance` 当成签到成功，不导出验证令牌给 requests。采用 [cloudflare-bypass-2026](https://github.com/1837620622/cloudflare-bypass-2026) 所介绍的 SeleniumBase UC 与 Xvfb 运行方式；本仓库实现了 GLaDOS 页面流程，没有复制该项目的源码。
+保留 WorkBuddy 验证过的域名配置、页面内按钮点击、Turnstile 资源检测、阶段日志和国内构建源。采用 [cloudflare-bypass-2026](https://github.com/1837620622/cloudflare-bypass-2026) 介绍的 SeleniumBase UC 运行方式。HTTP 200、捕获到响应或取得 cf_clearance 都不等于签到成功，最终判断实际签到接口和积分流水。
 
-**浏览器模式不是保证通过的方案。** Turnstile、设备校验或会话限制仍可能拒绝自动操作。需要人工验证或登录时，任务明确失败并走现有告警；当前容器不提供远程桌面，也不会使用第三方打码服务。不能仅凭离线测试保证你的账号首次签到或奖励恢复。
+## 已部署用户升级
 
-## 1. 准备部署目录
+1. 更新部署目录中的本包文件，**保留现有 `.env`**。
+2. `.env` 新增 `GLADOS_VNC_PASSWORD`，必须恰好 8 位英文字母/数字；不要复用原有的长调用密钥。保持已使用的 `GLADOS_ORIGIN=https://glados.one`。
+3. 用同目录的 `compose.yaml` 重新构建启动。只拉取青龙订阅不会更新浏览器镜像。
+4. 打开 NAS 的 8093 登录页，完成下述首次登录和保存。
+5. 青龙新增 `GLADOS_BROWSER_SESSION=profile`、`GLADOS_BROWSER_PROFILES=1`，运行仓库订阅更新脚本，再执行原签到任务。
 
-在 NAS 文件管理器创建一个目录，例如共享文件夹里的 `docker/glados-browser`。将本仓库 **browser 目录内的文件** 放进去，至少包括：
+本版增加 8094 远程桌面端口和 `glados-browser-data` 数据卷。此前没有数据卷的部署没有可迁移会话，需要首次登录一次。以后更新容器时保留该卷，**不要删除卷或执行 `docker compose down -v`**。
+
+## 部署文件及 .env
+
+将 browser 目录内所有构建文件放到 NAS，例如 `/volume1/docker/glados-browser`：
 
 ```text
 Dockerfile
@@ -16,119 +24,80 @@ compose.yaml
 requirements.txt
 server.py
 worker.py
+entrypoint.py
+login.html
+.dockerignore
 .env.example
 ```
 
-可以从本次提供的部署压缩包解压，也可从 GitHub 获取 browser 目录。它们是独立容器的构建文件，不需要在青龙容器里改代码。仅在青龙运行订阅不会自动创建浏览器容器。
-
-把 `.env.example` 复制为 `.env`（注意文件名开头的点），填写：
+新用户复制 `.env.example` 为 `.env`；已有用户只在原文件补充缺少的值：
 
 ```dotenv
-NAS_IP=192.168.1.100
-GLADOS_BROWSER_TOKEN=在这里填写自己生成的随机密钥
+NAS_IP=192.168.0.119
+GLADOS_BROWSER_TOKEN=自己的至少32位随机调用密钥
+GLADOS_VNC_PASSWORD=自己的8位字母数字密码
+GLADOS_ORIGIN=https://glados.one
 ```
 
-- `NAS_IP` 改成 DXP4800 的实际局域网 IP。不要填公网地址、`0.0.0.0` 或 `127.0.0.1`。
-- 密钥至少 32 个 ASCII 字符，无空格。可用密码管理器生成 48～64 位字母数字串。也可在有 Python 的终端执行 `python3 -c "import secrets; print(secrets.token_hex(32))"`。
-- 不要把 Cookie 放进 `.env`；Cookie 继续只在青龙环境变量里保存。
-- `.env` 已被 Git 和 Docker 构建上下文排除，勿手动上传到 GitHub。
+中文是占位说明，请替换。调用密钥至少 32 个无空格 ASCII 字符，推荐生成 48～64 位字母数字。VNC 协议仅使用前 8 字节，本版要求恰好 8 位，避免悄悄截断长密钥。Cookie、GLaDOS 密码和验证码不写入 `.env`。
 
-## 2. 在绿联 Docker 中启动
+域名支持 `glados.one`、`glados.rocks`、`glados.cloud` 的 HTTPS 地址。保存会话后保持域名不变；换域名需要重新登录。当前证据指向设备不匹配，不要求迁移域名。
 
-在绿联「Docker」→「项目」新建 Compose 项目，项目路径选择上面的 `docker/glados-browser` 目录，使用其中的 `compose.yaml` 构建并启动。需要选择**从本地目录构建镜像**；不要只粘贴 YAML 而缺少同目录的 Dockerfile/源码。不同 UGOS 版本的按钮名称可能不同。
-
-如果面板不支持构建，开启 NAS SSH，在实际部署目录执行：
+绿联 Docker 项目选择此目录的 Compose 文件构建启动，或在 NAS SSH 进入该目录执行：
 
 ```sh
 docker compose up -d --build
-docker compose logs --tail=30
+docker compose logs --tail=40
 ```
 
-首次构建要下载 Debian/Python 镜像、Chromium 和 Python 包，可能较慢。构建过程不需要 GLaDOS Cookie。容器使用最多 2 核、2 GB 内存，Chrome 仅在签到任务期间运行。
+镜像包含 Chromium、驱动、Tcl/Tk、Xvfb、Openbox、x11vnc 和 noVNC。启动时共享 X 显示屏。构建会运行无账号自检，但不登录或签到。最多使用 2 核、2 GB 内存，任务逐个执行。
 
-容器日志出现 `GLaDOS browser service 2026-11-11.5 ready on port 8093` 后，在局域网浏览器访问：
+默认保留 WorkBuddy 的阿里云 Debian 源和清华 PyPI 源，可通过 `.env` 的 `APT_MIRROR`、`PIP_INDEX_URL`、`PIP_EXTRA_INDEX_URL` 调整。pip 超时 120 秒、网络重试 8 次，BuildKit 保留下载缓存。Chrome 如需要代理，请显式设置 `GLADOS_BROWSER_PROXY`，不要假设它读取 HTTP_PROXY；地址必须从容器可达，不能用代表容器自己的 127.0.0.1。
 
-```text
-http://你的NAS局域网IP:8093/health
-```
+## 首次在 NAS 浏览器登录
 
-应看到 `"ok": true`。这只说明调用服务正常，尚未验证 Chrome 或 GLaDOS 签到。8093 只用于 NAS 局域网调用，不要做公网端口映射。Compose 不需要特权模式、host 网络或 Docker socket。
+1. 打开 `http://192.168.0.119:8093/`（按实际 IP 修改）。认证框用户名填 **glados**，密码填 **GLADOS_BROWSER_TOKEN** 的长密钥。
+2. 账号编号用 **1**，点击「启动登录浏览器」。
+3. 点击「打开远程浏览器」。noVNC 的连接密码填 **GLADOS_VNC_PASSWORD**。启动期间可能先看到空白桌面；当前 NAS 的 Chrome 冷启动可能仍需约 136 秒，请等待状态更新。
+4. 在远程 Chromium 中登录 GLaDOS，自行输入账号、密码/邮箱验证码并完成验证，确认进入账号页。**浏览器实际运行在 NAS 上，观看远程桌面的 Windows 电脑不会改变它的 Linux 身份。**
+5. 返回 8093 页，点击「保存登录并关闭浏览器」，等待「登录已保存」。未确认账号状态时不会显示保存成功。
 
-从版本 `2026-11-11.4` 开始，镜像构建会自动运行 `python worker.py --selftest`，实际启动浏览器、执行 JavaScript 并检查 Linux 显示环境；失败时停止构建，输出阶段、异常类型及固定分类，不输出 Cookie 或原始异常内容。此自检不访问 GLaDOS，不证明账号签到可以通过。
+登录操作不会自动签到，不注入 Windows Cookie，也不替你提交登录凭据。保存时正常关闭浏览器并写入配置，避免 UC 直接结束进程使会话未落盘。Chrome 配置保存在卷中的 `/data/profiles/1`，不会导出到青龙或日志。
 
-## 3. 在青龙新增环境变量
+多账号逐个选择编号 2、3 等登录保存，最多 20 个；各编号目录隔离。登录最长 15 分钟，期间青龙会提示服务忙，完成保存后再运行签到。日常任务运行时不要通过远程桌面操作该浏览器。
+
+8093、8094 仅绑定 NAS 局域网地址，**不要做公网映射**。5900 VNC 只监听容器内回环地址，不映射到 NAS。
+
+## 青龙环境变量
 
 | 名称 | 值 |
 | --- | --- |
 | `GLADOS_MODE` | `browser` |
-| `GLADOS_BROWSER_URL` | `http://你的NAS局域网IP:8093` |
-| `GLADOS_BROWSER_TOKEN` | 与容器 `.env` 中完全相同的密钥 |
-| `GLADOS_BROWSER_TIMEOUT` | 可选，默认 `180` 秒，可设 60～300 |
+| `GLADOS_BROWSER_SESSION` | `profile` |
+| `GLADOS_BROWSER_PROFILES` | `1`，多账号例如 `1,2` |
+| `GLADOS_BROWSER_URL` | `http://192.168.0.119:8093`，按实际 IP 填写 |
+| `GLADOS_BROWSER_TOKEN` | 与容器 .env 的长密钥一致 |
+| `GLADOS_BROWSER_TIMEOUT` | 可选，profile 默认 `420` 秒，范围 60～600 |
 
-保留原来的 `GLADOS_COOKIE`、邮件和企业微信配置，任务命令及定时规则不变：
+profile 模式**不需要且忽略 GLADOS_COOKIE / GLADOS_USER_AGENT**，使用 NAS 原生身份，不让桌面变量覆盖 Linux 会话。原变量可停用。邮件及企业微信配置保留，成功只有 1 分不会发失败邮件。
+
+运行仓库订阅更新青龙脚本；任务命令和定时规则继续使用：
 
 ```sh
 task Null993_Gladoscheckin/qinglong/glados.py
 ```
 
-`GLADOS_USER_AGENT` 如有填写，浏览器模式也会读取；应填写 Cookie 所属浏览器的真实值。**不要继续使用此前通用 Chrome/126 示例作为实际设备信息。** 未配置时浏览器模式使用容器 Chromium 原生 User-Agent。会话仍可能要求设备匹配；Cookie 能查询状态不等于能签到。
+日志应显示 `2026-11-11.6`，以及 profile 使用原生身份。重复签到视为正常结果；超时或结果不明不自动重放，请先核对流水。登录失效时到 8093 页选择对应编号重新登录保存。
 
-青龙与浏览器是两个容器，URL 中的 `127.0.0.1` 会指向青龙自己，必须使用 NAS 局域网 IP。`GLADOS_BROWSER_TOKEN` 会用于调用认证，Cookie 经该内网请求临时送入隔离浏览器，不写入服务日志或持久配置；不要将此接口暴露到不受信任的网络。
+未配置 profile 时仍使用旧 Cookie 模式以兼容已有部署；Cookie 模式不能通过复制 Windows Cookie 解决本次 Windows/Linux 设备差异，其默认超时仍为 180 秒。
 
-## 4. 拉取仓库更新并验证
+## 自检、更新和限制
 
-1. 在青龙「订阅管理」运行 `Null993_Gladoscheckin`，确认拉取成功。
-2. 手动运行原签到任务。应显示版本 `2026-11-11.5`、`签到模式: browser`、`使用 NAS 浏览器签到`。
-3. 等待任务结束。读取的是官网实际签到 POST 返回，仍需核对官网流水；当天已经签到时只会返回重复签到结果，无法证明明天奖励数额。
+- `/health` 无需认证，只说明服务正常，不代表登录或签到成功。
+- 青龙临时设置 `GLADOS_BROWSER_SELFTEST=1` 可运行无账号自检；完成后删除或禁用此变量，否则定时任务也只自检。
+- 容器终端可用 `python /app/worker.py --selftest`；不要在其他任务运行时同时自检，以免争用桌面。
+- 青龙更新运行订阅即可；浏览器更新需覆盖构建文件、保留 `.env` 和数据卷，再重新构建。
+- 持久会话等同于登录凭据，备份卷时按凭据保管，不上传到 GitHub。
+- `profile_not_ready` 表示编号尚未保存登录；`profile_origin_mismatch` 表示域名不一致。设备不匹配会显示登录和当前平台；进程异常提供阶段及类型，不打印 Cookie、验证码或 nonce/proof。
 
-多账号继续用换行或 `&` 分隔 Cookie，逐个执行。成功只有 1 分不会发送失败邮件。浏览器服务忙时会拒绝新任务，不排队反复签到；调用超时或结果不明时不会自动重试、不会回退到旧 HTTP 方式，请先核对官网流水。
-
-## 更新与排错
-
-### 自检浏览器环境，不触发签到
-
-先更新青龙脚本和浏览器容器至 `2026-11-11.5`。在青龙临时增加 `GLADOS_BROWSER_SELFTEST=1`，再运行原任务。此时不需要 Cookie，不发送签到或通知，只调用浏览器环境自检。
-
-通过后**删除或禁用 `GLADOS_BROWSER_SELFTEST`** 再执行真正签到，否则定时任务也只会自检。也可在容器终端执行 `python /app/worker.py --selftest`。此命令只适用于 `2026-11-11.4` 及更新版本。
-
-失败日志会包含类似 `stage=start_browser, diagnostic=SessionNotCreatedException, category=chrome_start_failed` 的信息，请反馈这部分。`WorkerExit` 表示子进程没有返回结果，需结合退出码及容器 OOM 状态排查。`/` 在旧版返回 `{"ok": false}` 是未知路径的响应，不代表健康检查失败；新版 `/` 与 `/health` 都显示服务信息。
-
-### MouseInfo 提示缺少 tkinter
-
-这是早期镜像遗漏了 Tcl/Tk 运行库。官方 `python:3.12-slim-bookworm` 的 Python 已编译 Tkinter，但 slim 清理过程不保留 Tk 的运行依赖。仅安装 Debian 的 `python3-tk` 会引入另一套系统 Python，不能据此保证 `/usr/local/bin/python` 可用。
-
-`2026-11-11.5` 的镜像已补装 `libtk8.6` / `libtcl8.6`，并在构建时验证 `import tkinter`。也修复了 MouseInfo 直接退出造成旧日志只显示 `failed` 的问题。
-
-现有容器可在终端临时验证修复：
-
-```sh
-apt-get update
-apt-get install -y --no-install-recommends libtk8.6 libtcl8.6
-python -c "import tkinter; print('Tkinter OK:', tkinter.TkVersion)"
-```
-
-正常应输出 `Tkinter OK: 8.6`，然后再执行浏览器启动测试或青龙任务。这只补装容器依赖，不修改签到代码。手动安装的依赖在重建容器后会丢失，长期使用请更新部署文件、保留 `.env` 并重新构建镜像。
-
-- **青龙脚本更新**：手动运行订阅即可。
-- **浏览器源码更新**：更新此部署目录中的 browser 文件，保留 `.env`，重新构建启动；只重启容器不会更新镜像内代码。
-- **服务无法连接**：先访问 `/health`，检查实际 NAS IP、8093 端口、防火墙、容器状态。青龙只对这个内网调用禁用环境代理，不修改系统代理。
-- **密钥不匹配**：核对青龙和 `.env` 的值；修改 `.env` 后重新创建容器。
-- **浏览器执行失败**：确认镜像构建完整、内存够用；查看容器日志。服务只输出固定状态，不输出原始异常或账号凭据。
-- **官网拒绝设备验证**：需要核对实际 Cookie/User-Agent；本模式不会伪造通过结果。
-- **浏览器验证未能自动完成**：到官网完成本次签到；此模式不保证每次通过 Turnstile。
-
-### 构建时 pip 下载超时
-
-如果日志显示 `files.pythonhosted.org ... Read timed out`，失败发生在依赖下载阶段，尚未启动浏览器或签到。Dockerfile 已将 pip 超时增加到 120 秒、网络重试设为 8 次，并使用 BuildKit 下载缓存；这些环境配置也会被 pip 安装源码包时启动的构建子进程继承。重新构建时不必加 `--no-cache`。
-
-默认仍使用官方 PyPI。若 NAS 直连不稳定，可在部署目录现有 `.env` 中额外添加下面一行，然后重新构建：
-
-```dotenv
-PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-```
-
-原有 NAS_IP 和密钥保持不变。这是此项目的构建参数，不修改 NAS 系统或青龙的全局 pip 配置。若镜像源缺少指定版本，删除这一行恢复官方源。
-
-Compose 已设置 `pull_policy: build`，直接从本地文件构建 `glados-browser:local`，不再先到 Docker Hub 拉取这个本地镜像名。基础 Python 镜像仍需要正常下载。
-
-本次开发验证包括离线服务接口测试和本地浏览器模拟页面测试；没有访问真实账号或在 DXP4800 上执行容器构建。NAS 的实际镜像构建和账号签到结果需要部署后验证。
+本地测试覆盖服务认证、独立目录、登录期间不签到，以及真实 Chrome 关闭后重启复用会话。尚未在你的 NAS 构建新镜像或用真实账号签到。此方案解决同一个 Linux 环境内登录和执行的问题，不能保证 Turnstile 或其他服务端校验每次自动通过。约 136 秒的启动耗时原因尚未确认，不把新增启动参数当作已解决。

@@ -3,7 +3,11 @@ services:
     build:
       context: .
       args:
-        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
+        # Debian 源镜像，可换 mirrors.tuna.tsinghua.edu.cn / mirrors.ustc.edu.cn
+        APT_MIRROR: "${APT_MIRROR:-mirrors.aliyun.com}"
+        # PyPI 源镜像
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}"
+        PIP_EXTRA_INDEX_URL: "${PIP_EXTRA_INDEX_URL:-}"
     image: glados-browser:local
     pull_policy: build
     container_name: glados-browser
@@ -16,10 +20,35 @@ services:
     pids_limit: 256
     ports:
       - "${NAS_IP:?Set NAS_IP in .env}:8093:8093"
+      - "${NAS_IP:?Set NAS_IP in .env}:8094:8094"
+    volumes:
+      - glados-browser-data:/data
     environment:
       GLADOS_BROWSER_TOKEN: "${GLADOS_BROWSER_TOKEN:?Set GLADOS_BROWSER_TOKEN in .env}"
+      GLADOS_VNC_PASSWORD: "${GLADOS_VNC_PASSWORD:?Set an 8-character VNC password in .env}"
+      GLADOS_PROFILE_ROOT: /data/profiles
+      # Cookie 来源域名，必须与 GLADOS_COOKIE 的取用域名完全一致。
+      # 你从哪个域名登录取的 Cookie，这里就填哪个：
+      #   https://glados.one  /  https://glados.rocks  /  https://glados.cloud
+      GLADOS_ORIGIN: "${GLADOS_ORIGIN:-https://glados.rocks}"
+      GLADOS_BROWSER_PROXY: "${GLADOS_BROWSER_PROXY:-}"
+      # Python 工具需要代理时可设置 HTTP_PROXY/HTTPS_PROXY。
+      # 这些变量只用于 Python 等支持环境代理的工具；Chrome 使用 GLADOS_BROWSER_PROXY。
+      # 注意：容器里的 127.0.0.1 指向容器自身，代理地址要写 NAS 局域网 IP。
+      # 不填时为空字符串。
+      http_proxy: "${HTTP_PROXY:-}"
+      https_proxy: "${HTTPS_PROXY:-}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,::1}"
+    # 容器内 DNS 解析失败时启用（宿主机 curl 正常、容器内失败）
+    # dns:
+    #   - 223.5.5.5
+    #   - 119.29.29.29
     logging:
       driver: json-file
       options:
         max-size: 5m
         max-file: "2"
+
+volumes:
+  glados-browser-data:
+    name: glados-browser-data
