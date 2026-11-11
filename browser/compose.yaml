@@ -1,0 +1,21 @@
+services:
+  glados-browser:
+    build: .
+    image: glados-browser:local
+    container_name: glados-browser
+    platform: linux/amd64
+    restart: unless-stopped
+    init: true
+    shm_size: 1gb
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    ports:
+      - "${NAS_IP:?Set NAS_IP in .env}:8093:8093"
+    environment:
+      GLADOS_BROWSER_TOKEN: "${GLADOS_BROWSER_TOKEN:?Set GLADOS_BROWSER_TOKEN in .env}"
+    logging:
+      driver: json-file
+      options:
+        max-size: 5m
+        max-file: "2"

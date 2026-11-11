@@ -14,6 +14,7 @@ import ssl
 import sys
 import time
 import traceback
+from urllib.parse import urlsplit
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 
@@ -38,7 +39,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
-SCRIPT_VERSION = "2026-11-11.2"
+SCRIPT_VERSION = "2026-11-11.3"
 
 
 class RetryableRequestError(RuntimeError):
@@ -370,6 +371,8 @@ def checkin_account(
     service_retries: int,
     service_retry_delay: int,
 ) -> str:
+    if os.environ.get("GLADOS_MODE", "http").strip().lower() == "browser":
+        return browser_checkin_account(cookie, account_no)
     headers = {
         "cookie": cookie,
         "referer": "https://glados.rocks/console/checkin",
@@ -427,15 +430,83 @@ def checkin_account(
     return f"{email} ---- {message} ---- 剩余 {left_days} 天"
 
 
+def browser_checkin_account(cookie: str, account_no: int) -> str:
+    base_url = os.environ.get("GLADOS_BROWSER_URL", "").strip().rstrip("/")
+    token = os.environ.get("GLADOS_BROWSER_TOKEN", "").strip()
+    parsed = urlsplit(base_url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("请配置 GLADOS_BROWSER_URL，例如 http://NAS局域网IP:8093")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise RuntimeError("GLADOS_BROWSER_URL 只能包含协议、主机和端口")
+    if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
+        raise RuntimeError("GLADOS_BROWSER_TOKEN 至少需要 32 个无空格 ASCII 字符，并与浏览器容器一致")
+    timeout = env_int("GLADOS_BROWSER_TIMEOUT", 180, 60, 300)
+    print(f"账号 {account_no} 使用 NAS 浏览器签到（最长 {timeout} 秒）", flush=True)
+    try:
+        # 此请求会触发真实签到，超时后状态未知，禁止自动重放或回退到 HTTP 模式。
+        with requests.Session() as session:
+            session.trust_env = False  # NAS 内网调用不经过全局 HTTP_PROXY。
+            response = session.post(
+                base_url + "/checkin", headers={"Authorization": "Bearer " + token},
+                json={
+                    "cookie": cookie, "timeout": timeout,
+                    "user_agent": browser_user_agent() if os.environ.get("GLADOS_USER_AGENT", "").strip() else None,
+                },
+                timeout=(10, timeout + 20), allow_redirects=False,
+            )
+            if response.status_code == 401:
+                raise RuntimeError("浏览器服务密钥不匹配，请核对两边 GLADOS_BROWSER_TOKEN")
+            if response.status_code == 409:
+                raise RuntimeError("浏览器服务正在执行另一项签到，请等待原任务结束")
+            if response.status_code != 200:
+                raise RuntimeError(f"浏览器服务返回 HTTP {response.status_code}，未重试")
+            result = response.json()
+    except requests.Timeout:
+        raise RuntimeError("浏览器服务调用超时，签到状态未知；请先核对官网流水，不会自动重试") from None
+    except (requests.RequestException, ValueError) as exc:
+        raise RuntimeError(f"浏览器服务连接或响应异常（{type(exc).__name__}），未自动重试") from None
+    if not isinstance(result, dict):
+        raise RuntimeError("浏览器服务响应格式异常")
+    if result.get("ok") is not True:
+        # 只接受服务端固定错误分类，不回显可能含凭据的页面或异常内容。
+        reasons = {
+            "login_required": "浏览器会话未登录，请更新 Cookie；必要时需在浏览器环境重新登录",
+            "verification_required": "浏览器验证未能自动完成，请在官网签到；不保证 Turnstile 自动通过",
+            "page_changed": "未找到官网签到按钮，页面结构可能已变更",
+            "timeout": "浏览器任务超时，签到状态未知，请先核对官网流水",
+            "browser_error": "浏览器执行失败，请查看容器是否正常及 Chrome 是否安装完整",
+            "invalid_cookie": "Cookie 格式无效，请复制完整 Cookie 值",
+        }
+        raise RuntimeError(reasons.get(result.get("error"), "浏览器服务执行失败"))
+    checkin, state = result.get("checkin"), result.get("state")
+    if not isinstance(checkin, dict) or not isinstance(state, dict):
+        raise RuntimeError("浏览器服务缺少签到或状态结果")
+    if not is_successful_checkin(checkin):
+        if is_auth_failure(checkin):
+            raise RuntimeError("官网拒绝浏览器会话认证/设备验证，请在官网核对登录状态")
+        raise RuntimeError(f"浏览器签到失败: {checkin.get('message', '未知错误')}")
+    if state.get("code") != 0 or not isinstance(state.get("data"), dict) or "leftDays" not in state["data"]:
+        raise RuntimeError("浏览器签到已有响应，但账号状态查询失败，请先核对官网流水")
+    data = state["data"]
+    return (
+        f"{data.get('email', f'账号 {account_no}')} ---- "
+        f"{checkin.get('message', '签到成功')} ---- 剩余 {str(data['leftDays']).split('.', 1)[0]} 天"
+    )
+
+
 def main() -> int:
     if requests is None:
         raise RuntimeError(f"requests 依赖导入失败: {REQUESTS_IMPORT_ERROR}")
 
     print(f"GLaDOS 青龙签到版本 {SCRIPT_VERSION}", flush=True)
+    mode = os.environ.get("GLADOS_MODE", "http").strip().lower()
+    if mode not in ("http", "browser"):
+        raise RuntimeError("GLADOS_MODE 仅支持 http 或 browser")
+    print(f"签到模式: {mode}", flush=True)
     print(
         "User-Agent: " + (
             "已读取 GLADOS_USER_AGENT" if os.environ.get("GLADOS_USER_AGENT", "").strip()
-            else "未配置，使用默认值"
+            else ("未配置，使用浏览器原生值" if mode == "browser" else "未配置，使用默认值")
         ), flush=True,
     )
 

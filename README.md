@@ -1,5 +1,7 @@
 # GLaDOS 自动签到（GitHub Actions / 青龙面板）
 
+**绿联 DXP4800 / N100 / Docker 青龙遇到 Turnstile 验证：**新增独立浏览器模式，配置及部署步骤见 [browser/README.md](browser/README.md)。通过青龙环境变量 `GLADOS_MODE=browser` 启用，需要先部署浏览器容器；未配置时仍使用原 HTTP 模式。
+
 本仓库同时保留 GitHub Actions 原版和 NAS 青龙增强版，两套版本彼此隔离：
 
 | 版本 | 脚本 | 定时配置 |
@@ -19,7 +21,7 @@
 
 版本 `2026-11-11.2` 在 challenge 未要求 Turnstile 时按官网提交 `tsState: off`；如果返回有效的 Turnstile 配置，停止提交并提示到官网完成签到，不伪造状态或复用其他请求的验证令牌。如果服务端仍返回 `Automated check-in detected. Please sign in again to continue.`，仅能确定当前请求被拒绝，无法仅凭该文字断定是 Cookie、请求头、网络或其他校验造成。浏览器手动成功也不代表纯 HTTP 脚本可用；换 User-Agent 不能替代浏览器验证。
 
-启动日志会显示版本号、是否读取 `GLADOS_USER_AGENT`，以及本次 challenge 是否要求 Turnstile，不输出 Cookie、nonce、proof 或令牌。若最新版仍无法自动签到，需要使用官网完成签到；此版本未实现浏览器运行模式。
+启动日志会显示版本号、运行模式及是否读取 `GLADOS_USER_AGENT`，不输出 Cookie、nonce、proof 或令牌。HTTP 模式无法处理 Turnstile；浏览器模式的部署和限制见 [独立浏览器模式](browser/README.md)。
 
 已有青龙用户更新步骤：
 

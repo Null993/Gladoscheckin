@@ -1,0 +1,120 @@
+"""Exercise the service protocol over a local socket; no real account requests."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import threading
+import unittest
+from unittest.mock import patch
+
+import requests
+
+
+def module(name, path):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / path)
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+server = module("browser_server", "browser/server.py")
+worker = module("browser_worker", "browser/worker.py")
+glados = module("browser_glados", "qinglong/glados.py")
+TOKEN = "offline-test-token-" + "x" * 32
+SUCCESS = {
+    "ok": True, "checkin": {"code": 0, "message": "Checkin! Got 1 Points"},
+    "state": {"code": 0, "data": {"email": "test@example.com", "leftDays": "10.5"}},
+}
+
+
+class BrowserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.http = server.create_server(("127.0.0.1", 0), TOKEN)
+        cls.thread = threading.Thread(target=cls.http.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = "http://127.0.0.1:" + str(cls.http.server_port)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.http.shutdown()
+        cls.http.server_close()
+        cls.thread.join(timeout=5)
+
+    def client(self):
+        return patch.dict(os.environ, {
+            "GLADOS_MODE": "browser", "GLADOS_BROWSER_URL": self.url,
+            "GLADOS_BROWSER_TOKEN": TOKEN, "GLADOS_COOKIE": "gld:sess=fake",
+        }, clear=True)
+
+    def test_authentication_and_validation_prevent_browser_launch(self):
+        with patch.object(server, "execute_job") as execute:
+            cases = [
+                ({}, {"cookie": "x=y"}, 401),
+                ({"Authorization": "Bearer " + TOKEN}, {"cookie": "x=y", "timeout": 99999}, 400),
+                ({"Authorization": "Bearer " + TOKEN}, {"cookie": "x=y", "user_agent": "x\ny"}, 400),
+            ]
+            for headers, payload, status in cases:
+                response = requests.post(self.url + "/checkin", headers=headers, json=payload, timeout=5)
+                self.assertEqual(response.status_code, status)
+            execute.assert_not_called()
+
+    def test_browser_mode_preserves_one_point_success_without_email(self):
+        with self.client(), patch.object(server, "execute_job", return_value=SUCCESS) as execute, \
+                patch.object(glados, "send_failure_email") as email, patch.object(glados, "send_wecom"):
+            self.assertEqual(glados.main(), 0)
+            execute.assert_called_once()
+            self.assertIsNone(execute.call_args.args[0]["user_agent"])
+            email.assert_not_called()
+
+    def test_browser_mode_does_not_replay_error_or_leak_unknown_error(self):
+        with self.client(), patch.object(server, "execute_job", return_value={"ok": False, "error": "private-cookie"}) as execute:
+            with self.assertRaises(RuntimeError) as caught:
+                glados.checkin_account("x=y", 1, 3, 30, 3, 30)
+            execute.assert_called_once()
+            self.assertNotIn("private-cookie", str(caught.exception))
+
+    def test_browser_auth_failure_is_not_success(self):
+        payload = dict(SUCCESS, checkin={"code": -2, "message": "Automated check-in detected"})
+        with self.client(), patch.object(server, "execute_job", return_value=payload):
+            with self.assertRaisesRegex(RuntimeError, "认证/设备验证"):
+                glados.browser_checkin_account("x=y", 1)
+
+    def test_concurrent_job_is_rejected_instead_of_queued(self):
+        server.LOCK.acquire()
+        try:
+            with self.client(), patch.object(server, "execute_job") as execute:
+                with self.assertRaisesRegex(RuntimeError, "另一项签到"):
+                    glados.browser_checkin_account("x=y", 1)
+                execute.assert_not_called()
+        finally:
+            server.LOCK.release()
+
+    def test_client_timeout_never_retries(self):
+        with self.client(), patch.object(glados.requests.Session, "post", side_effect=requests.Timeout) as post:
+            with self.assertRaisesRegex(RuntimeError, "状态未知"):
+                glados.browser_checkin_account("x=y", 1)
+            post.assert_called_once()
+
+    def test_worker_timeout_kills_process(self):
+        with patch.object(server.subprocess, "Popen") as factory, patch.object(server.os, "killpg", create=True) as killpg:
+            process = factory.return_value
+            process.communicate.side_effect = [subprocess.TimeoutExpired("worker", 60), ("", None)]
+            self.assertEqual(server.execute_job({"timeout": 60}), {"ok": False, "error": "timeout"})
+            if os.name == "nt":
+                process.kill.assert_called_once()
+            else:
+                killpg.assert_called_once()
+
+    def test_cookie_parser_preserves_equals_and_rejects_injection(self):
+        self.assertEqual(worker.parse_cookies("gld:sess=a==; gld:sess.sig=b"), {
+            "gld:sess": "a==", "gld:sess.sig": "b",
+        })
+        for raw in ("", None, "a=b\r\nsecret=x", "Cookie: a=b", "missing-value"):
+            with self.assertRaises(ValueError):
+                worker.parse_cookies(raw)
+
+
+if __name__ == "__main__":
+    unittest.main()
