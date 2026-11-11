@@ -7,7 +7,21 @@
 | GitHub Actions 原版 | `glados.py` | `.github/workflows/runGladosAction.yml` |
 | 青龙增强版 | `qinglong/glados.py` | 在青龙面板中配置 |
 
-原有 GitHub Actions 的脚本和定时配置保持不变。青龙版单独提供网络重试、多账号、可调超时和更完整的失败检测。
+青龙版提供官网一次性 challenge 验证、网络重试、多账号、可调超时和失败检测。此次更新针对 NAS / 青龙的 `qinglong/glados.py`；根目录 GitHub Actions 原版仍使用旧流程，不包含本次验证适配。
+
+### 2026-11 签到验证更新
+
+参考 [issue #28](https://github.com/lankerr/2026-glados-checkin/issues/28)、[PR #31](https://github.com/lankerr/2026-glados-checkin/pull/31) 和 [PR #33](https://github.com/lankerr/2026-glados-checkin/pull/33)（核对版本 `8649193124403fb0195c66a6e4be8b7d2103b96b`）：官网已增加一次性 challenge。旧脚本只提交 token，缺少这一流程。感谢原项目维护者及 chengchang1987-cloud 的排查。
+
+青龙版现在先在 `glados.rocks` 获取 challenge，等待 2.7 秒后在同一域名提交 nonce、SHA-256 proof 和域名 token。验证不可用或格式异常时停止；验证过期、网络异常或服务临时错误需要重试时，重新获取验证，不复用旧 nonce，也不回退到仅提交 token 的旧流程。无需安装浏览器或手动处理验证码，Python 依赖仍只有 `requests`。
+
+已有青龙用户更新步骤：
+
+1. 将本次代码推送到订阅使用的仓库后，在青龙「订阅管理」手动运行一次 `Null993_Gladoscheckin` 订阅，拉取新版 `qinglong/glados.py`，无需直接修改 NAS 上的代码。
+2. 保留原有 `GLADOS_COOKIE`、任务命令、定时规则和通知配置。建议增加 `GLADOS_USER_AGENT`，值为获取 Cookie 时所用浏览器的完整 User-Agent。
+3. 下次运行时检查日志是否出现 `已获取签到验证，等待 2.7 秒`，并核对首次签到的返回分数和官网积分流水。
+
+若今天已经签到，再次执行通常只会返回“今日已记录”，不能验证下次奖励；此前已入账的 1 分不会由脚本补发。issue 维护者反馈更新后一个账号连续两天获得 12 分，但奖励仍由服务端决定，不能保证固定分数。返回成功且只有 1 分时仍按成功处理，在日志和已配置的企业微信通知中显示原始结果，不触发失败邮件。
 
 ## GitHub Actions 原版
 
@@ -60,6 +74,7 @@ requests
 | 变量名 | 必填 | 说明 |
 | --- | --- | --- |
 | `GLADOS_COOKIE` | 是 | GLaDOS 网站的完整 Cookie |
+| `GLADOS_USER_AGENT` | 否，建议配置 | 获取 Cookie 的浏览器 User-Agent；未填则使用内置值。会话若校验设备，应与浏览器保持一致 |
 | `WECOM_WEBHOOK` | 否 | 企业微信群机器人的 Webhook 地址 |
 | `GLADOS_TIMEOUT` | 否 | 单次读取超时秒数，默认 `30`，范围 5～120 |
 | `GLADOS_RETRIES` | 否 | 首次请求失败后的重试次数，默认 `3`，范围 0～8 |
@@ -85,10 +100,24 @@ requests
 Cookie 类似：
 
 ```text
-koa:sess=...; koa:sess.sig=...
+gld:sess=...; gld:sess.sig=...
 ```
 
 Cookie 等同于登录凭证，请只保存在青龙环境变量中，不要写入脚本、日志或提交到 GitHub。
+
+新版会话常见名称为 `gld:sess` / `gld:sess.sig`，请复制当前登录浏览器的完整值，不要手动把名称改为旧版 `koa:sess`。同一请求的 `User-Agent` 值可用于 `GLADOS_USER_AGENT`，也可在浏览器控制台执行 `navigator.userAgent` 获取，粘贴时不带外层引号。多账号共用此 User-Agent，建议在同一种浏览器环境中获取各账号 Cookie。
+
+### 在青龙添加 User-Agent
+
+进入青龙「环境变量」→「新建变量」，名称填写 `GLADOS_USER_AGENT`，值填写完整的单行 User-Agent，保存并启用。不要把 `GLADOS_USER_AGENT=` 或 `User-Agent:` 一起填进值里。
+
+以下是可直接填写的完整示例（也是脚本内置默认值）：
+
+```text
+Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36
+```
+
+这个示例不是从你的浏览器读取的，不能保证与现有 Cookie 的设备信息匹配。若要保持一致，推荐在获取 Cookie 的浏览器里执行 `navigator.userAgent`，用实际结果替换示例。只需在青龙保存环境变量，订阅拉取仓库不会覆盖该变量。
 
 ### 失败邮件告警
 
@@ -121,14 +150,22 @@ your@email.com ---- Checkin Successfully ---- 剩余 123 天
 
 如果当天已经签到，脚本会把“重复签到”视为正常结果。若全部重试后仍失败，任务会以失败状态结束，并在日志及已配置的企业微信中显示原因。
 
+新版首次签到可能返回 `Checkin! Got 12 Points`，重复签到可能返回 `Today's observation logged`。challenge 获取成功的日志只表示获取了验证，最终仍以签到接口结果及官网流水为准。HTTP 401/403 或设备校验失败时，请重新获取 Cookie 并核对 User-Agent；不会反复提交请求。
+
 ## 重试机制
 
-网络请求失败后，脚本会按 2、4、8 秒逐步等待并重试。默认配置下，每轮网络请求最多尝试 4 次、每次读取等待 30 秒。
+网络请求失败后，脚本会按 2、4、8 秒逐步等待并重试。默认配置下，签到流程最多进行 3 次额外网络重试；每次重新获取 challenge 并等待 2.7 秒后再提交。状态查询独立最多尝试 4 次，每次读取等待 30 秒。
 
 如果接口正常返回、但提示 `Submarine cable data not ready. Please try again in a moment.` 等服务端临时错误，脚本会另外按 30、60、120 秒等待后再次发起签到；这组重试不会被前面的网络超时或 502 消耗。Cookie 失效等非临时错误不会反复重试。
+
+每次业务重试同样使用全新 challenge。验证缺失、结构无效或请求发生重定向时明确失败，不发送旧版签到请求，也不会转到其他域名重放凭据。
 
 若 NAS 到 GLaDOS 的网络长期不稳定，可把 `GLADOS_TIMEOUT` 调到 `60`、`GLADOS_RETRIES` 调到 `4`；若 GLaDOS 服务本身经常短时不可用，可把 `GLADOS_SERVICE_RETRIES` 调到 `5`。
 
 ## 青龙随机延迟
 
 青龙的 `RandomDelay` 是全局随机延迟配置，不是脚本自身行为。例如任务日志显示随机延迟 2639 秒，09:30 的任务实际要到 10:14 左右才开始。若不需要该行为，请在青龙配置文件中将 `RandomDelay` 的值置空（或按所用青龙版本设为 `0`），保存后重启相关调度服务；也可以保留它来错峰运行。
+
+## 开发验证
+
+安装 `qinglong/requirements.txt` 后，运行 `python -m unittest discover -s tests -v`。测试模拟响应及等待，覆盖验证计算、过期/异常验证、提交失败后获取新验证、临时业务重试、认证失败、重复签到、多账号和 1 分成功不发失败邮件，不访问真实账号。

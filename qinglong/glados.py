@@ -6,6 +6,9 @@ new Env('GLaDOS 青龙签到');
 from __future__ import annotations
 
 import os
+import hashlib
+import math
+import re
 import smtplib
 import ssl
 import sys
@@ -25,10 +28,37 @@ else:
 
 CHECKIN_URL = "https://glados.rocks/api/user/checkin"
 STATUS_URL = "https://glados.rocks/api/user/status"
+CHALLENGE_URL = "https://glados.rocks/api/user/checkin/challenge"
+CHALLENGE_DELAY = 2.7
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
+
+
+class RetryableRequestError(RuntimeError):
+    """网络或响应错误；签到重试必须重新获取 challenge。"""
+
+
+def browser_user_agent() -> str:
+    value = os.environ.get("GLADOS_USER_AGENT", "").strip()
+    if not value:
+        return DEFAULT_USER_AGENT
+    if value.lower().startswith("user-agent:"):
+        value = value[len("user-agent:"):].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError("GLADOS_USER_AGENT 无效，请复制浏览器的单行 User-Agent 值")
+    try:
+        value.encode("latin-1")
+    except UnicodeEncodeError:
+        raise ValueError("GLADOS_USER_AGENT 包含不支持的字符，请重新复制") from None
+    return value
 
 
 def env_int(variable: str, default: int, minimum: int, maximum: int) -> int:
@@ -125,11 +155,15 @@ def request_json(
 ) -> Dict[str, Any]:
     """发起请求；遇到超时、网络异常、5xx 或非法 JSON 时指数退避重试。"""
     attempts = retries + 1
-    last_error: Optional[Exception] = None
+    last_error = "未知错误"
 
     for attempt in range(1, attempts + 1):
         try:
-            response = session.request(method, url, timeout=(10, timeout), **kwargs)
+            response = session.request(
+                method, url, timeout=(10, timeout), allow_redirects=False, **kwargs
+            )
+            if 300 <= response.status_code < 400:
+                raise RuntimeError(f"{description}发生重定向，已停止以避免跨域提交凭据")
             if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
                 raise RuntimeError(
                     f"{description}被服务器拒绝（HTTP {response.status_code}），不再重试"
@@ -137,20 +171,25 @@ def request_json(
             response.raise_for_status()
             data = response.json()
             if not isinstance(data, dict):
-                raise ValueError(f"接口返回的不是 JSON 对象: {data!r}")
+                raise ValueError("接口返回的不是 JSON 对象")
             return data
         except (requests.RequestException, ValueError) as exc:
-            last_error = exc
+            # requests 的异常可能包含 Cookie/请求头，不输出原始异常内容。
+            if isinstance(exc, requests.exceptions.InvalidHeader):
+                raise RuntimeError("请求头格式无效，请检查 Cookie 和 User-Agent") from None
+            last_error = type(exc).__name__
             if attempt == attempts:
                 break
             wait_seconds = min(2 ** attempt, 30)
             print(
-                f"{description}失败（第 {attempt}/{attempts} 次）: {exc}；"
+                f"{description}失败（第 {attempt}/{attempts} 次）: {last_error}；"
                 f"{wait_seconds} 秒后重试"
             )
             time.sleep(wait_seconds)
 
-    raise RuntimeError(f"{description}在 {attempts} 次尝试后仍失败: {last_error}")
+    raise RetryableRequestError(
+        f"{description}在 {attempts} 次尝试后仍失败: {last_error}"
+    ) from None
 
 
 def split_cookies(raw_cookies: str) -> List[str]:
@@ -163,7 +202,65 @@ def is_already_checked_in(message: str) -> bool:
     normalized = message.lower()
     return any(
         marker in normalized
-        for marker in ("repeat", "already", "tomorrow", "已签到", "重复签到")
+        for marker in (
+            "checkin repeats", "already checked in", "already checked-in",
+            "today's observation logged", "已签到", "重复签到", "今日已记录",
+        )
+    )
+
+
+def is_auth_failure(result: Dict[str, Any]) -> bool:
+    message = str(result.get("message", "")).lower()
+    return (
+        result.get("code") == -2 or result.get("reason") == "device-mismatch"
+        or any(marker in message for marker in (
+            "没有权限", "permission", "unauthorized", "automated check-in detected",
+        ))
+    )
+
+
+def is_successful_checkin(result: Dict[str, Any]) -> bool:
+    if is_auth_failure(result):
+        return False
+    message = str(result.get("message", ""))
+    return (
+        result.get("code") == 0 or is_already_checked_in(message)
+        or re.search(r"checkin!\s*got\s+\d+\s+points?\b", message, re.I) is not None
+    )
+
+
+def verified_checkin(
+    session: requests.Session,
+    headers: Dict[str, str],
+    account_no: int,
+    timeout: int,
+) -> Dict[str, Any]:
+    """遵循官网一次性 challenge 协议；失败时禁止退回 token-only 请求。"""
+    challenge = request_json(
+        session, "GET", CHALLENGE_URL, f"账号 {account_no} 获取签到验证",
+        headers=headers, retries=0, timeout=timeout,
+    )
+    received_at = time.monotonic()
+    nonce = challenge.get("nonce")
+    ttl = challenge.get("ttl", 300000)  # 官网 TTL 单位为毫秒。
+    if (
+        challenge.get("code") != 0
+        or not isinstance(nonce, str) or not 0 < len(nonce) <= 4096
+        or type(ttl) not in (int, float)
+        or (type(ttl) is float and not math.isfinite(ttl))
+        or ttl <= CHALLENGE_DELAY * 1000
+    ):
+        raise RuntimeError("签到 challenge 不可用或格式无效；已停止，未提交旧版签到")
+    proof = hashlib.sha256((nonce + ".glados-observe-v1").encode("utf-8")).hexdigest()
+    print(f"账号 {account_no} 已获取签到验证，等待 {CHALLENGE_DELAY} 秒", flush=True)
+    time.sleep(CHALLENGE_DELAY)
+    if (time.monotonic() - received_at) * 1000 >= ttl:
+        raise RetryableRequestError("签到 challenge 已过期，未提交签到")
+    # POST 失败不可重放同一 nonce；外层网络重试重新获取验证。
+    return request_json(
+        session, "POST", CHECKIN_URL, f"账号 {account_no} 签到请求",
+        headers=headers, json={"token": "glados.rocks", "nonce": nonce, "proof": proof},
+        retries=0, timeout=timeout,
     )
 
 
@@ -197,32 +294,35 @@ def checkin_with_service_retry(
     service_retry_delay: int,
 ) -> Dict[str, Any]:
     """在网络重试之外，对 GLaDOS 的临时业务错误进行较长间隔重试。"""
-    attempts = service_retries + 1
-    for attempt in range(1, attempts + 1):
-        result = request_json(
-            session,
-            "POST",
-            CHECKIN_URL,
-            f"账号 {account_no} 签到请求",
-            headers=headers,
-            json={"token": "glados.cloud"},
-            retries=retries,
-            timeout=timeout,
-        )
+    network_failures = 0
+    service_failures = 0
+    while True:
+        try:
+            result = verified_checkin(session, headers, account_no, timeout)
+        except RetryableRequestError:
+            if network_failures >= retries:
+                raise
+            network_failures += 1
+            wait_seconds = min(2 ** network_failures, 30)
+            print(
+                f"账号 {account_no} 签到验证/提交失败；{wait_seconds} 秒后重新获取验证 "
+                f"（网络重试 {network_failures}/{retries}）", flush=True,
+            )
+            time.sleep(wait_seconds)
+            continue
         message = str(result.get("message", "未知状态"))
-        if result.get("code") == 0 or is_already_checked_in(message):
+        if is_successful_checkin(result) or is_auth_failure(result):
             return result
-        if not is_temporary_service_error(message) or attempt == attempts:
+        if not is_temporary_service_error(message) or service_failures >= service_retries:
             return result
 
-        wait_seconds = min(service_retry_delay * (2 ** (attempt - 1)), 300)
+        wait_seconds = min(service_retry_delay * (2 ** service_failures), 300)
+        service_failures += 1
         print(
-            f"账号 {account_no} 签到服务暂不可用（第 {attempt}/{attempts} 次）: "
-            f"{message}；{wait_seconds} 秒后重试"
+            f"账号 {account_no} 签到服务暂不可用（重试 {service_failures}/{service_retries}）: "
+            f"{message}；{wait_seconds} 秒后重新获取验证", flush=True,
         )
         time.sleep(wait_seconds)
-
-    return result
 
 
 def send_wecom(webhook: str, content: str, retries: int, timeout: int) -> None:
@@ -263,11 +363,13 @@ def checkin_account(
         "cookie": cookie,
         "referer": "https://glados.rocks/console/checkin",
         "origin": "https://glados.rocks",
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
-        ),
+        "user-agent": browser_user_agent(),
         "content-type": "application/json;charset=UTF-8",
+        "accept": "application/json, text/plain, */*",
+        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
 
     with requests.Session() as session:
@@ -295,12 +397,12 @@ def checkin_account(
 
     data = state.get("data")
     if not isinstance(data, dict) or "leftDays" not in data:
-        raise RuntimeError(f"状态接口结构发生变化: {state}")
+        raise RuntimeError("状态接口结构发生变化，缺少 leftDays")
 
     email = data.get("email", f"账号 {account_no}")
     left_days = str(data["leftDays"]).split(".", 1)[0]
     message = str(checkin.get("message", "未知状态"))
-    successful = checkin.get("code") == 0 or is_already_checked_in(message)
+    successful = is_successful_checkin(checkin)
     if not successful:
         raise RuntimeError(f"签到接口返回失败: {message}")
 
@@ -359,6 +461,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     try:
         exit_code = main()
     except Exception:
