@@ -67,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/health"):
-            self.reply(200, {"ok": True, "service": "glados-browser", "version": "2026-11-11.4"})
+            self.reply(200, {"ok": True, "service": "glados-browser", "version": "2026-11-11.5"})
         else:
             self.reply(404, {"ok": False})
 
@@ -143,5 +143,5 @@ def create_server(address, token):
 
 if __name__ == "__main__":
     server = create_server(("0.0.0.0", 8093), os.environ.get("GLADOS_BROWSER_TOKEN", ""))
-    print("GLaDOS browser service 2026-11-11.4 ready on port 8093", flush=True)
+    print("GLaDOS browser service 2026-11-11.5 ready on port 8093", flush=True)
     server.serve_forever()

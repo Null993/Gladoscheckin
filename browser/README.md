@@ -46,7 +46,7 @@ docker compose logs --tail=30
 
 首次构建要下载 Debian/Python 镜像、Chromium 和 Python 包，可能较慢。构建过程不需要 GLaDOS Cookie。容器使用最多 2 核、2 GB 内存，Chrome 仅在签到任务期间运行。
 
-容器日志出现 `GLaDOS browser service 2026-11-11.4 ready on port 8093` 后，在局域网浏览器访问：
+容器日志出现 `GLaDOS browser service 2026-11-11.5 ready on port 8093` 后，在局域网浏览器访问：
 
 ```text
 http://你的NAS局域网IP:8093/health
@@ -78,7 +78,7 @@ task Null993_Gladoscheckin/qinglong/glados.py
 ## 4. 拉取仓库更新并验证
 
 1. 在青龙「订阅管理」运行 `Null993_Gladoscheckin`，确认拉取成功。
-2. 手动运行原签到任务。应显示版本 `2026-11-11.4`、`签到模式: browser`、`使用 NAS 浏览器签到`。
+2. 手动运行原签到任务。应显示版本 `2026-11-11.5`、`签到模式: browser`、`使用 NAS 浏览器签到`。
 3. 等待任务结束。读取的是官网实际签到 POST 返回，仍需核对官网流水；当天已经签到时只会返回重复签到结果，无法证明明天奖励数额。
 
 多账号继续用换行或 `&` 分隔 Cookie，逐个执行。成功只有 1 分不会发送失败邮件。浏览器服务忙时会拒绝新任务，不排队反复签到；调用超时或结果不明时不会自动重试、不会回退到旧 HTTP 方式，请先核对官网流水。
@@ -87,11 +87,27 @@ task Null993_Gladoscheckin/qinglong/glados.py
 
 ### 自检浏览器环境，不触发签到
 
-先更新青龙脚本和浏览器容器至 `2026-11-11.4`。在青龙临时增加 `GLADOS_BROWSER_SELFTEST=1`，再运行原任务。此时不需要 Cookie，不发送签到或通知，只调用浏览器环境自检。
+先更新青龙脚本和浏览器容器至 `2026-11-11.5`。在青龙临时增加 `GLADOS_BROWSER_SELFTEST=1`，再运行原任务。此时不需要 Cookie，不发送签到或通知，只调用浏览器环境自检。
 
 通过后**删除或禁用 `GLADOS_BROWSER_SELFTEST`** 再执行真正签到，否则定时任务也只会自检。也可在容器终端执行 `python /app/worker.py --selftest`。此命令只适用于 `2026-11-11.4` 及更新版本。
 
 失败日志会包含类似 `stage=start_browser, diagnostic=SessionNotCreatedException, category=chrome_start_failed` 的信息，请反馈这部分。`WorkerExit` 表示子进程没有返回结果，需结合退出码及容器 OOM 状态排查。`/` 在旧版返回 `{"ok": false}` 是未知路径的响应，不代表健康检查失败；新版 `/` 与 `/health` 都显示服务信息。
+
+### MouseInfo 提示缺少 tkinter
+
+这是早期镜像遗漏了 Tcl/Tk 运行库。官方 `python:3.12-slim-bookworm` 的 Python 已编译 Tkinter，但 slim 清理过程不保留 Tk 的运行依赖。仅安装 Debian 的 `python3-tk` 会引入另一套系统 Python，不能据此保证 `/usr/local/bin/python` 可用。
+
+`2026-11-11.5` 的镜像已补装 `libtk8.6` / `libtcl8.6`，并在构建时验证 `import tkinter`。也修复了 MouseInfo 直接退出造成旧日志只显示 `failed` 的问题。
+
+现有容器可在终端临时验证修复：
+
+```sh
+apt-get update
+apt-get install -y --no-install-recommends libtk8.6 libtcl8.6
+python -c "import tkinter; print('Tkinter OK:', tkinter.TkVersion)"
+```
+
+正常应输出 `Tkinter OK: 8.6`，然后再执行浏览器启动测试或青龙任务。这只补装容器依赖，不修改签到代码。手动安装的依赖在重建容器后会丢失，长期使用请更新部署文件、保留 `.env` 并重新构建镜像。
 
 - **青龙脚本更新**：手动运行订阅即可。
 - **浏览器源码更新**：更新此部署目录中的 browser 文件，保留 `.env`，重新构建启动；只重启容器不会更新镜像内代码。

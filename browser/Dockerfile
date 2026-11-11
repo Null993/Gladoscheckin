@@ -4,7 +4,9 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 CHROME_BINARY=/usr/bin/chromium
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium chromium-driver xvfb xauth fonts-liberation fonts-noto-cjk \
     x11-utils x11-xserver-utils libglib2.0-0 libnss3 libasound2 \
+    libtk8.6 libtcl8.6 \
     && rm -rf /var/lib/apt/lists/*
+RUN python -c "import tkinter; print('Tkinter runtime OK:', tkinter.TkVersion)"
 WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \

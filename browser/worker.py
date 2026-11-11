@@ -90,6 +90,9 @@ def run_browser(job, progress=None):
             cookies = parse_cookies(job.get("cookie"))
         except ValueError:
             return {"ok": False, "error": "invalid_cookie"}
+    if sys.platform.startswith("linux"):
+        progress["stage"] = "import_tkinter"
+        import tkinter  # Verify the same interpreter before MouseInfo can exit.
     progress["stage"] = "import_seleniumbase"
     from seleniumbase import SB
 
@@ -170,6 +173,7 @@ def classify_exception(exc):
     """Inspect locally; only emit fixed labels, never raw exceptions or URLs."""
     message = str(exc).lower()
     for markers, label in (
+        (("libtk8.6", "libtcl8.6", "_tkinter", "tkinter"), "tkinter_missing"),
         (("cannot find chrome binary", "chrome not found", "binary is not a chrome executable"), "chrome_missing"),
         (("only supports chrome version", "current browser version", "version of chromedriver"), "driver_mismatch"),
         (("missing x server", "cannot open display", "bad display", "displaynameerror", "xvfb"), "display_error"),
@@ -191,7 +195,7 @@ def main():
         # Suppress third-party debug output: it may include session details.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             result = run_browser(job, progress)
-    except Exception as exc:
+    except (Exception, SystemExit) as exc:
         frames = traceback.extract_tb(exc.__traceback__)
         location = frames[-1] if frames else None
         result = {

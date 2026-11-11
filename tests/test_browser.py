@@ -1,6 +1,7 @@
 """Exercise the service protocol over a local socket; no real account requests."""
 import importlib.util
 import json
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -157,8 +158,23 @@ class BrowserTests(unittest.TestCase):
             ("only supports Chrome version 130", "driver_mismatch"),
             ("Cannot open display :99 private-cookie", "display_error"),
             ("unexpected private-cookie", "unclassified"),
+            ("libtk8.6.so: cannot open shared object file", "tkinter_missing"),
         ):
             self.assertEqual(worker.classify_exception(RuntimeError(message)), expected)
+
+    def test_mouseinfo_system_exit_returns_diagnostic_instead_of_silent_exit(self):
+        def mouseinfo_exit(job, progress):
+            progress["stage"] = "start_browser"
+            raise SystemExit(0)
+        with patch.object(worker, "run_browser", side_effect=mouseinfo_exit), \
+                patch.object(worker.sys, "stdin", io.StringIO('{"cookie":"fake"}')), \
+                patch.object(worker.sys, "argv", ["worker.py"]), \
+                patch("sys.stdout", new_callable=io.StringIO) as output:
+            worker.main()
+            payload = json.loads(output.getvalue().split(worker.RESULT_MARKER)[1])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["diagnostic"], "SystemExit")
+        self.assertEqual(payload["stage"], "start_browser")
 
 
 if __name__ == "__main__":
