@@ -15,6 +15,21 @@ from unittest.mock import patch
 
 @unittest.skipUnless(os.environ.get("GLADOS_BROWSER_SMOKE") == "1", "opt-in real Chrome fixture")
 class BrowserSmokeTests(unittest.TestCase):
+    def test_selftest_runs_javascript_without_external_site(self):
+        from seleniumbase import SB
+        spec = importlib.util.spec_from_file_location("selftest_worker", Path(__file__).resolve().parents[1] / "browser/worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+
+        def fixture_browser(**options):
+            if os.name == "nt":
+                options["headless"] = True
+            return SB(**options)
+
+        with patch("seleniumbase.SB", side_effect=fixture_browser):
+            result = worker.run_browser({"operation": "selftest", "timeout": 60})
+        self.assertEqual(result, {"ok": True, "selftest": True, "stage": "complete"})
+
     def test_official_page_style_xhr_is_captured_once(self):
         from seleniumbase import SB
         spec = importlib.util.spec_from_file_location("smoke_worker", Path(__file__).resolve().parents[1] / "browser/worker.py")

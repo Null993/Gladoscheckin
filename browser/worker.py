@@ -6,6 +6,8 @@ import os
 import sys
 import tempfile
 import time
+import traceback
+from pathlib import Path
 
 ORIGIN = "https://glados.rocks"
 RESULT_MARKER = "GLADOS_RESULT:"
@@ -78,11 +80,17 @@ def parse_cookies(raw):
     return cookies
 
 
-def run_browser(job):
-    try:
-        cookies = parse_cookies(job.get("cookie"))
-    except ValueError:
-        return {"ok": False, "error": "invalid_cookie"}
+def run_browser(job, progress=None):
+    progress = progress if progress is not None else {}
+    progress["stage"] = "parse_input"
+    selftest = job.get("operation") == "selftest"
+    cookies = {}
+    if not selftest:
+        try:
+            cookies = parse_cookies(job.get("cookie"))
+        except ValueError:
+            return {"ok": False, "error": "invalid_cookie"}
+    progress["stage"] = "import_seleniumbase"
     from seleniumbase import SB
 
     budget = max(60, min(int(job.get("timeout", 180)), 300))
@@ -98,19 +106,35 @@ def run_browser(job):
         options["agent"] = job["user_agent"]
     with tempfile.TemporaryDirectory(prefix="glados-profile-") as profile:
         options["user_data_dir"] = profile
+        progress["stage"] = "start_browser"
         with SB(**options) as sb:
+            progress["stage"] = "configure_browser"
             sb.driver.set_page_load_timeout(40)
             sb.driver.set_script_timeout(20)
+            if selftest:
+                progress["stage"] = "selftest_page"
+                sb.open("data:text/html,<html><title>GLaDOS browser self-test</title></html>")
+                value = sb.execute_script("return 21 * 2")
+                if value != 42:
+                    raise RuntimeError("browser_javascript_failed")
+                if sys.platform.startswith("linux"):
+                    progress["stage"] = "selftest_display"
+                    import pyautogui
+                    pyautogui.size()
+                return {"ok": True, "selftest": True, "stage": "complete"}
+            progress["stage"] = "inject_cookies"
             # Set host-scoped cookies before opening the app, so login and
             # challenge requests all run in the same browser, UA and egress.
             sb.driver.execute_cdp_cmd("Network.setCookies", {"cookies": [
                 {"name": name, "value": value, "url": ORIGIN + "/", "path": "/", "secure": True}
                 for name, value in cookies.items()
             ]})
+            progress["stage"] = "open_checkin_page"
             sb.uc_open_with_reconnect(ORIGIN + "/console/checkin", reconnect_time=3)
             # UC opens a new tab. Install observation on that tab before the
             # first click, rather than attaching it to the old blank target.
             sb.execute_script(OBSERVER)
+            progress["stage"] = "wait_checkin_page"
             clicked = False
             last_gui_attempt = 0.0
             while time.monotonic() < deadline:
@@ -121,6 +145,7 @@ def run_browser(job):
                     return {"ok": False, "error": "login_required"}
                 result = sb.execute_script("return window.__gladosCheckinResult || null")
                 if result:
+                    progress["stage"] = "read_status"
                     state = sb.driver.execute_async_script(STATUS_QUERY)
                     return {"ok": True, "checkin": result, "state": state}
                 # Reference project uses UC + a real display for optional
@@ -133,21 +158,52 @@ def run_browser(job):
                     except Exception:
                         pass
                 if not clicked and sb.is_element_visible("button.ckb:not([disabled])"):
+                    progress["stage"] = "click_checkin"
                     sb.click("button.ckb:not([disabled])")
                     clicked = True  # Never click again, including on errors.
+                    progress["stage"] = "wait_checkin_response"
                 time.sleep(0.5)
             return {"ok": False, "error": "verification_required" if clicked else "page_changed"}
 
 
+def classify_exception(exc):
+    """Inspect locally; only emit fixed labels, never raw exceptions or URLs."""
+    message = str(exc).lower()
+    for markers, label in (
+        (("cannot find chrome binary", "chrome not found", "binary is not a chrome executable"), "chrome_missing"),
+        (("only supports chrome version", "current browser version", "version of chromedriver"), "driver_mismatch"),
+        (("missing x server", "cannot open display", "bad display", "displaynameerror", "xvfb"), "display_error"),
+        (("devtoolsactiveport", "chrome failed to start", "chrome instance exited", "chrome not reachable", "cannot connect to chrome"), "chrome_start_failed"),
+        (("err_name_not_resolved", "name resolution", "getaddrinfo"), "dns_error"),
+        (("err_connection", "err_proxy", "err_tunnel"), "network_error"),
+        (("err_cert_", "certificate verify failed"), "certificate_error"),
+        (("invalid cookie", "invalid parameters"), "cookie_rejected"),
+    ):
+        if any(marker in message for marker in markers):
+            return label
+    return "unclassified"
+
+
 def main():
+    progress = {"stage": "read_input"}
     try:
-        job = json.loads(sys.stdin.read(65536))
+        job = {"operation": "selftest", "timeout": 60} if "--selftest" in sys.argv else json.loads(sys.stdin.read(65536))
         # Suppress third-party debug output: it may include session details.
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            result = run_browser(job)
+            result = run_browser(job, progress)
     except Exception as exc:
-        result = {"ok": False, "error": "browser_error", "diagnostic": type(exc).__name__}
+        frames = traceback.extract_tb(exc.__traceback__)
+        location = frames[-1] if frames else None
+        result = {
+            "ok": False, "error": "browser_error", "diagnostic": type(exc).__name__,
+            "stage": progress["stage"], "category": classify_exception(exc),
+        }
+        if location:
+            result["diagnostic_file"] = Path(location.filename).name
+            result["diagnostic_line"] = location.lineno
     print(RESULT_MARKER + json.dumps(result, ensure_ascii=True), flush=True)
+    if "--selftest" in sys.argv and not result.get("ok"):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

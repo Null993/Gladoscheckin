@@ -46,13 +46,15 @@ docker compose logs --tail=30
 
 首次构建要下载 Debian/Python 镜像、Chromium 和 Python 包，可能较慢。构建过程不需要 GLaDOS Cookie。容器使用最多 2 核、2 GB 内存，Chrome 仅在签到任务期间运行。
 
-容器日志出现 `GLaDOS browser service 2026-11-11.3 ready on port 8093` 后，在局域网浏览器访问：
+容器日志出现 `GLaDOS browser service 2026-11-11.4 ready on port 8093` 后，在局域网浏览器访问：
 
 ```text
 http://你的NAS局域网IP:8093/health
 ```
 
 应看到 `"ok": true`。这只说明调用服务正常，尚未验证 Chrome 或 GLaDOS 签到。8093 只用于 NAS 局域网调用，不要做公网端口映射。Compose 不需要特权模式、host 网络或 Docker socket。
+
+从版本 `2026-11-11.4` 开始，镜像构建会自动运行 `python worker.py --selftest`，实际启动浏览器、执行 JavaScript 并检查 Linux 显示环境；失败时停止构建，输出阶段、异常类型及固定分类，不输出 Cookie 或原始异常内容。此自检不访问 GLaDOS，不证明账号签到可以通过。
 
 ## 3. 在青龙新增环境变量
 
@@ -76,12 +78,20 @@ task Null993_Gladoscheckin/qinglong/glados.py
 ## 4. 拉取仓库更新并验证
 
 1. 在青龙「订阅管理」运行 `Null993_Gladoscheckin`，确认拉取成功。
-2. 手动运行原签到任务。应显示版本 `2026-11-11.3`、`签到模式: browser`、`使用 NAS 浏览器签到`。
+2. 手动运行原签到任务。应显示版本 `2026-11-11.4`、`签到模式: browser`、`使用 NAS 浏览器签到`。
 3. 等待任务结束。读取的是官网实际签到 POST 返回，仍需核对官网流水；当天已经签到时只会返回重复签到结果，无法证明明天奖励数额。
 
 多账号继续用换行或 `&` 分隔 Cookie，逐个执行。成功只有 1 分不会发送失败邮件。浏览器服务忙时会拒绝新任务，不排队反复签到；调用超时或结果不明时不会自动重试、不会回退到旧 HTTP 方式，请先核对官网流水。
 
 ## 更新与排错
+
+### 自检浏览器环境，不触发签到
+
+先更新青龙脚本和浏览器容器至 `2026-11-11.4`。在青龙临时增加 `GLADOS_BROWSER_SELFTEST=1`，再运行原任务。此时不需要 Cookie，不发送签到或通知，只调用浏览器环境自检。
+
+通过后**删除或禁用 `GLADOS_BROWSER_SELFTEST`** 再执行真正签到，否则定时任务也只会自检。也可在容器终端执行 `python /app/worker.py --selftest`。此命令只适用于 `2026-11-11.4` 及更新版本。
+
+失败日志会包含类似 `stage=start_browser, diagnostic=SessionNotCreatedException, category=chrome_start_failed` 的信息，请反馈这部分。`WorkerExit` 表示子进程没有返回结果，需结合退出码及容器 OOM 状态排查。`/` 在旧版返回 `{"ok": false}` 是未知路径的响应，不代表健康检查失败；新版 `/` 与 `/health` 都显示服务信息。
 
 - **青龙脚本更新**：手动运行订阅即可。
 - **浏览器源码更新**：更新此部署目录中的 browser 文件，保留 `.env`，重新构建启动；只重启容器不会更新镜像内代码。

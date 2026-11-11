@@ -115,6 +115,51 @@ class BrowserTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 worker.parse_cookies(raw)
 
+    def test_selftest_requires_no_cookie_and_does_not_send_notifications(self):
+        env = {
+            "GLADOS_MODE": "browser", "GLADOS_BROWSER_URL": self.url,
+            "GLADOS_BROWSER_TOKEN": TOKEN, "GLADOS_BROWSER_SELFTEST": "1",
+        }
+        with patch.dict(os.environ, env, clear=True), \
+                patch.object(server, "execute_job", return_value={"ok": True, "selftest": True}) as execute, \
+                patch.object(glados, "send_failure_email") as email, patch.object(glados, "send_wecom") as wecom:
+            self.assertEqual(glados.main(), 0)
+            job = execute.call_args.args[0]
+            self.assertEqual(job["cookie"], "")
+            self.assertEqual(job["operation"], "selftest")
+            email.assert_not_called()
+            wecom.assert_not_called()
+
+    def test_diagnostics_expose_stage_and_class_without_raw_exception(self):
+        result = {
+            "ok": False, "error": "browser_error", "stage": "start_browser",
+            "diagnostic": "TypeError", "category": "unclassified", "message": "private-cookie",
+        }
+        with self.client(), patch.object(server, "execute_job", return_value=result):
+            with self.assertRaises(RuntimeError) as caught:
+                glados.browser_checkin_account("x=y", 1)
+            self.assertIn("stage=start_browser", str(caught.exception))
+            self.assertIn("diagnostic=TypeError", str(caught.exception))
+            self.assertNotIn("private-cookie", str(caught.exception))
+
+    def test_worker_without_output_reports_exit_code(self):
+        with patch.object(server.subprocess, "Popen") as factory:
+            process = factory.return_value
+            process.communicate.return_value = ("native library crash", None)
+            process.returncode = -9
+            result = server.execute_job({"timeout": 60})
+            self.assertEqual(result["diagnostic"], "WorkerExit")
+            self.assertEqual(result["exit_code"], -9)
+
+    def test_exception_classification_never_exports_original_details(self):
+        for message, expected in (
+            ("chrome not reachable private-cookie", "chrome_start_failed"),
+            ("only supports Chrome version 130", "driver_mismatch"),
+            ("Cannot open display :99 private-cookie", "display_error"),
+            ("unexpected private-cookie", "unclassified"),
+        ):
+            self.assertEqual(worker.classify_exception(RuntimeError(message)), expected)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -37,7 +37,10 @@ def execute_job(job):
                     return value
             except ValueError:
                 break
-    return {"ok": False, "error": "browser_error"}
+    return {
+        "ok": False, "error": "browser_error", "diagnostic": "WorkerExit",
+        "exit_code": process.returncode, "stage": "worker_process",
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -63,13 +66,13 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def do_GET(self):
-        if self.path == "/health":
-            self.reply(200, {"ok": True, "service": "glados-browser", "version": "2026-11-11.3"})
+        if self.path in ("/", "/health"):
+            self.reply(200, {"ok": True, "service": "glados-browser", "version": "2026-11-11.4"})
         else:
             self.reply(404, {"ok": False})
 
     def do_POST(self):
-        if self.path != "/checkin":
+        if self.path not in ("/checkin", "/selftest"):
             self.reply(404, {"ok": False})
             return
         expected = "Bearer " + self.server.token
@@ -85,9 +88,10 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) != size:
                 raise ValueError()
             job = json.loads(body)
-            if not isinstance(job, dict) or not isinstance(job.get("cookie"), str):
+            if not isinstance(job, dict):
                 raise ValueError()
-            if not 0 < len(job["cookie"]) <= 32000:
+            selftest = self.path == "/selftest"
+            if not selftest and (not isinstance(job.get("cookie"), str) or not 0 < len(job["cookie"]) <= 32000):
                 raise ValueError()
             timeout = job.get("timeout", 180)
             if type(timeout) is not int or not 60 <= timeout <= 300:
@@ -98,7 +102,10 @@ class Handler(BaseHTTPRequestHandler):
                 or any(ord(c) < 32 or ord(c) == 127 for c in agent)
             ):
                 raise ValueError()
-            job = {"cookie": job["cookie"], "user_agent": agent, "timeout": timeout}
+            job = {
+                "cookie": "" if selftest else job["cookie"], "user_agent": agent,
+                "timeout": timeout, "operation": "selftest" if selftest else "checkin",
+            }
         except (ValueError, OSError):
             self.reply(400, {"ok": False, "error": "invalid_request"})
             return
@@ -109,12 +116,15 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.settimeout(timeout + 20)
             result = execute_job(job)
             label = "response_received" if result.get("ok") else "failed"
-            diagnostic = result.get("diagnostic")
-            if diagnostic in (
-                "SessionNotCreatedException", "WebDriverException", "TimeoutException",
-                "FileNotFoundError", "ModuleNotFoundError", "PermissionError",
-            ):
-                label += " (" + diagnostic + ")"
+            for key in ("stage", "diagnostic", "category"):
+                value = result.get(key)
+                if isinstance(value, str) and value.isascii() and value.replace("_", "").isalnum() and len(value) <= 64:
+                    label += " " + key + "=" + value
+            if type(result.get("exit_code")) is int:
+                label += " exit_code=" + str(result["exit_code"])
+            filename, line = result.get("diagnostic_file"), result.get("diagnostic_line")
+            if isinstance(filename, str) and filename.isascii() and filename.replace("_", "").replace(".", "").isalnum() and len(filename) <= 64 and type(line) is int:
+                label += " location=" + filename + ":" + str(line)
             print("Browser job finished: " + label, flush=True)
             self.reply(200, result)
         except Exception:
@@ -133,5 +143,5 @@ def create_server(address, token):
 
 if __name__ == "__main__":
     server = create_server(("0.0.0.0", 8093), os.environ.get("GLADOS_BROWSER_TOKEN", ""))
-    print("GLaDOS browser service 2026-11-11.3 ready on port 8093", flush=True)
+    print("GLaDOS browser service 2026-11-11.4 ready on port 8093", flush=True)
     server.serve_forever()

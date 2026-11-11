@@ -39,7 +39,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
-SCRIPT_VERSION = "2026-11-11.3"
+SCRIPT_VERSION = "2026-11-11.4"
 
 
 class RetryableRequestError(RuntimeError):
@@ -430,7 +430,7 @@ def checkin_account(
     return f"{email} ---- {message} ---- 剩余 {left_days} 天"
 
 
-def browser_checkin_account(cookie: str, account_no: int) -> str:
+def browser_service_request(cookie: str, account_no: int, selftest: bool = False) -> Dict[str, Any]:
     base_url = os.environ.get("GLADOS_BROWSER_URL", "").strip().rstrip("/")
     token = os.environ.get("GLADOS_BROWSER_TOKEN", "").strip()
     parsed = urlsplit(base_url)
@@ -441,13 +441,17 @@ def browser_checkin_account(cookie: str, account_no: int) -> str:
     if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
         raise RuntimeError("GLADOS_BROWSER_TOKEN 至少需要 32 个无空格 ASCII 字符，并与浏览器容器一致")
     timeout = env_int("GLADOS_BROWSER_TIMEOUT", 180, 60, 300)
-    print(f"账号 {account_no} 使用 NAS 浏览器签到（最长 {timeout} 秒）", flush=True)
+    print(
+        f"浏览器环境自检（最长 {timeout} 秒，不访问 GLaDOS）" if selftest else
+        f"账号 {account_no} 使用 NAS 浏览器签到（最长 {timeout} 秒）", flush=True,
+    )
     try:
         # 此请求会触发真实签到，超时后状态未知，禁止自动重放或回退到 HTTP 模式。
         with requests.Session() as session:
             session.trust_env = False  # NAS 内网调用不经过全局 HTTP_PROXY。
             response = session.post(
-                base_url + "/checkin", headers={"Authorization": "Bearer " + token},
+                base_url + ("/selftest" if selftest else "/checkin"),
+                headers={"Authorization": "Bearer " + token},
                 json={
                     "cookie": cookie, "timeout": timeout,
                     "user_agent": browser_user_agent() if os.environ.get("GLADOS_USER_AGENT", "").strip() else None,
@@ -477,7 +481,25 @@ def browser_checkin_account(cookie: str, account_no: int) -> str:
             "browser_error": "浏览器执行失败，请查看容器是否正常及 Chrome 是否安装完整",
             "invalid_cookie": "Cookie 格式无效，请复制完整 Cookie 值",
         }
-        raise RuntimeError(reasons.get(result.get("error"), "浏览器服务执行失败"))
+        message = reasons.get(result.get("error"), "浏览器服务执行失败")
+        details = []
+        for key in ("stage", "diagnostic", "category"):
+            value = result.get(key)
+            if isinstance(value, str) and value.isascii() and value.replace("_", "").isalnum() and len(value) <= 64:
+                details.append(key + "=" + value)
+        if type(result.get("exit_code")) is int:
+            details.append("exit_code=" + str(result["exit_code"]))
+        filename, line = result.get("diagnostic_file"), result.get("diagnostic_line")
+        if isinstance(filename, str) and filename.isascii() and filename.replace("_", "").replace(".", "").isalnum() and len(filename) <= 64 and type(line) is int:
+            details.append("location=" + filename + ":" + str(line))
+        if details:
+            message += " [" + ", ".join(details) + "]"
+        raise RuntimeError(message)
+    return result
+
+
+def browser_checkin_account(cookie: str, account_no: int) -> str:
+    result = browser_service_request(cookie, account_no)
     checkin, state = result.get("checkin"), result.get("state")
     if not isinstance(checkin, dict) or not isinstance(state, dict):
         raise RuntimeError("浏览器服务缺少签到或状态结果")
@@ -509,6 +531,17 @@ def main() -> int:
             else ("未配置，使用浏览器原生值" if mode == "browser" else "未配置，使用默认值")
         ), flush=True,
     )
+
+    if mode == "browser" and os.environ.get("GLADOS_BROWSER_SELFTEST", "").strip() == "1":
+        try:
+            result = browser_service_request("", 0, selftest=True)
+            if result.get("selftest") is not True:
+                raise RuntimeError("服务响应不是自检结果，请更新浏览器容器")
+            print("浏览器自检通过：Chromium、驱动、JavaScript 和 Linux 显示环境可用；未执行签到")
+            return 0
+        except RuntimeError as exc:
+            print(f"浏览器自检失败: {exc}")
+            return 1
 
     raw_cookies = os.environ.get("GLADOS_COOKIE", "").strip()
     webhook = os.environ.get("WECOM_WEBHOOK", "").strip()

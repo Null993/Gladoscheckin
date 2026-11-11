@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && cp /usr/bin/chromedriver /usr/local/lib/python3.12/site-packages/seleniumbase/drivers/uc_driver \
     && chmod 755 /usr/local/lib/python3.12/site-packages/seleniumbase/drivers/uc_driver
 COPY server.py worker.py /app/
+RUN python worker.py --selftest
 EXPOSE 8093
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8093/health',timeout=3)"
