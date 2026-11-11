@@ -117,4 +117,18 @@ python -c "import tkinter; print('Tkinter OK:', tkinter.TkVersion)"
 - **官网拒绝设备验证**：需要核对实际 Cookie/User-Agent；本模式不会伪造通过结果。
 - **浏览器验证未能自动完成**：到官网完成本次签到；此模式不保证每次通过 Turnstile。
 
+### 构建时 pip 下载超时
+
+如果日志显示 `files.pythonhosted.org ... Read timed out`，失败发生在依赖下载阶段，尚未启动浏览器或签到。Dockerfile 已将 pip 超时增加到 120 秒、网络重试设为 8 次，并使用 BuildKit 下载缓存；这些环境配置也会被 pip 安装源码包时启动的构建子进程继承。重新构建时不必加 `--no-cache`。
+
+默认仍使用官方 PyPI。若 NAS 直连不稳定，可在部署目录现有 `.env` 中额外添加下面一行，然后重新构建：
+
+```dotenv
+PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+原有 NAS_IP 和密钥保持不变。这是此项目的构建参数，不修改 NAS 系统或青龙的全局 pip 配置。若镜像源缺少指定版本，删除这一行恢复官方源。
+
+Compose 已设置 `pull_policy: build`，直接从本地文件构建 `glados-browser:local`，不再先到 Docker Hub 拉取这个本地镜像名。基础 Python 镜像仍需要正常下载。
+
 本次开发验证包括离线服务接口测试和本地浏览器模拟页面测试；没有访问真实账号或在 DXP4800 上执行容器构建。NAS 的实际镜像构建和账号签到结果需要部署后验证。

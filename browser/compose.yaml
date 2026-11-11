@@ -1,7 +1,11 @@
 services:
   glados-browser:
-    build: .
+    build:
+      context: .
+      args:
+        PIP_INDEX_URL: "${PIP_INDEX_URL:-https://pypi.org/simple}"
     image: glados-browser:local
+    pull_policy: build
     container_name: glados-browser
     platform: linux/amd64
     restart: unless-stopped
