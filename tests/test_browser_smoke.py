@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import threading
 import tempfile
+import contextlib
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -16,6 +17,112 @@ from unittest.mock import patch
 
 @unittest.skipUnless(os.environ.get("GLADOS_BROWSER_SMOKE") == "1", "opt-in real Chrome fixture")
 class BrowserSmokeTests(unittest.TestCase):
+    def test_closed_shadow_widget_auto_and_human_handoff_each_submit_once(self):
+        from seleniumbase import SB
+        spec = importlib.util.spec_from_file_location("challenge_smoke_worker", Path(__file__).resolve().parents[1] / "browser/worker.py")
+        worker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(worker)
+        human, posts = [False], []
+
+        class Fixture(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def send(self, value, kind="application/json"):
+                body = value.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", kind)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/fixture-human":
+                    self.send(json.dumps({"done": human[0]}))
+                elif self.path == "/api/user/status":
+                    self.send('{"code":0,"data":{"leftDays":"12"}}')
+                else:
+                    self.send('''<html><div id="widget" style="width:300px;height:65px;margin:80px">Local verification fixture</div>
+                      <input type="hidden" name="cf-turnstile-response" id="answer"><button disabled class="ckb" onclick="this.disabled=true;fetch('/api/user/checkin',{method:'POST'})">Checkin</button>
+                      <script>const host=document.querySelector('#widget'); const shadow=host.attachShadow({mode:'closed'});
+                      shadow.innerHTML='<iframe style="width:300px;height:65px;border:0;pointer-events:none" src="https://challenges.cloudflare.com/turnstile/fixture"></iframe>';
+                      const answer=document.querySelector('#answer'); const solve=()=>{answer.value='fixture-response';document.querySelector('.ckb').disabled=false;};
+                      host.onclick=solve;window.turnstile={getResponse:()=>answer.value,isExpired:()=>false};
+                      setInterval(()=>fetch('/fixture-human').then(r=>r.json()).then(d=>{if(d.done)solve();}),200);
+                      </script></html>''', "text/html")
+
+            def do_POST(self):
+                posts.append(self.path)
+                self.send('{"code":0,"message":"Checkin! Got 1 Points"}')
+
+        http = ThreadingHTTPServer(("127.0.0.1", 0), Fixture)
+        thread = threading.Thread(target=http.serve_forever, daemon=True)
+        thread.start()
+
+        @contextlib.contextmanager
+        def browser(**options):
+            if os.name == "nt":
+                options.update(headless=True, headed=False)
+            with SB(**options) as sb:
+                # The fixture has a real closed-shadow iframe node, but must
+                # never contact Cloudflare or test a live provider challenge.
+                sb.driver.execute_cdp_cmd("Network.enable", {})
+                sb.driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": ["*://challenges.cloudflare.com/*"]})
+                yield sb
+
+        def local_click(sb, box):
+            for event in ("mousePressed", "mouseReleased"):
+                sb.driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": event, "x": box["x"] + 30, "y": box["y"] + 32,
+                    "button": "left", "clickCount": 1,
+                })
+            return True
+
+        try:
+            for mode in ("auto", "human"):
+                human[0] = False
+                posts.clear()
+                stop, forwarded = threading.Event(), threading.Event()
+                with tempfile.TemporaryDirectory(prefix="glados-challenge-smoke-") as root:
+                    stage = Path(root) / "stage"
+
+                    def help_human():
+                        while not stop.wait(0.1):
+                            if stage.with_name("glados-verification.json").exists():
+                                image = stage.with_name("glados-verification.png")
+                                if image.exists() and image.read_bytes().startswith(b"\x89PNG"):
+                                    forwarded.set()
+                                human[0] = True
+                                return
+
+                    helper = threading.Thread(target=help_human, daemon=True)
+                    if mode == "human":
+                        helper.start()
+                    controller = worker.TurnstileController(manual_wait=30, auto_wait=35 if mode == "auto" else 1)
+                    try:
+                        with patch.object(worker, "STAGE_FILE", str(stage)), \
+                                patch.object(worker, "ORIGIN", "http://127.0.0.1:" + str(http.server_port)), \
+                                patch("seleniumbase.SB", side_effect=browser), \
+                                patch.object(worker, "TurnstileController", return_value=controller), \
+                                patch.object(worker, "click_turnstile_checkbox", side_effect=local_click) as click:
+                            result = worker.run_browser({"cookie": "gld:sess=fixture", "timeout": 90})
+                        self.assertTrue(result["ok"], result)
+                        self.assertEqual(posts, ["/api/user/checkin"])
+                        if mode == "auto":
+                            click.assert_called_once()
+                        else:
+                            click.assert_not_called()
+                            self.assertTrue(forwarded.is_set())
+                        self.assertFalse(stage.with_name("glados-verification.json").exists())
+                    finally:
+                        stop.set()
+                        if mode == "human":
+                            helper.join(timeout=5)
+        finally:
+            http.shutdown()
+            http.server_close()
+            thread.join(timeout=5)
+
     def test_native_login_profile_survives_browser_restart_and_does_not_inject_windows_cookie(self):
         from seleniumbase import SB
         spec = importlib.util.spec_from_file_location("persistent_smoke_worker", Path(__file__).resolve().parents[1] / "browser/worker.py")

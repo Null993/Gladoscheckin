@@ -1,5 +1,7 @@
 # GLaDOS 自动签到（GitHub Actions / 青龙面板）
 
+**2026-11-14 v7 更新：**浏览器模式增加验证组件检测与有限自动尝试；未完成时保留当前任务，发送验证局部截图（邮件）及局域网/已配置的 HTTPS 外网接管链接，人工验证后自动继续。外网只需转发 8093，并在青龙设置 `GLADOS_BROWSER_PUBLIC_URL`。详见 [v7 部署与接管说明](browser/README.md)。
+
 **绿联 DXP4800 / N100 / Docker 青龙遇到 Turnstile 验证：**新增独立浏览器模式，配置及部署步骤见 [browser/README.md](browser/README.md)。通过青龙环境变量 `GLADOS_MODE=browser` 启用，需要先部署浏览器容器；未配置时仍使用原 HTTP 模式。
 
 **Windows 登录、NAS 签到返回 `device-mismatch`：**版本 `2026-11-11.6` 支持在 NAS 的 8093 登录页打开远程 Linux 浏览器并保存会话，青龙用 `GLADOS_BROWSER_SESSION=profile` 复用，不再跨系统复制 Cookie。部署时保留 `.env`，新增 8 位 `GLADOS_VNC_PASSWORD`，详细步骤见上述说明。

@@ -9,6 +9,11 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
+import http.client
+import socket
+import select
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 LOCK = threading.Lock()
@@ -19,7 +24,38 @@ STAGE_FILE = Path(os.environ.get("GLADOS_STAGE_FILE", str(Path(tempfile.gettempd
 LOGIN_FINISH = STAGE_FILE.with_name("glados-login-finish")
 LOGIN_STATE = {"running": False, "profile_id": None, "result": None}
 LOGIN_STATE_LOCK = threading.Lock()
-VERSION = "2026-11-11.6"
+VERSION = "2026-11-14.7"
+TASK_STATE_LOCK = threading.Lock()
+TASK_STATE = {"running": False}
+DESKTOP_BACKEND = ("127.0.0.1", 8094)
+
+
+def verification_path(suffix):
+    return STAGE_FILE.with_name("glados-verification." + suffix)
+
+
+def clear_task_state():
+    with TASK_STATE_LOCK:
+        TASK_STATE.clear()
+        TASK_STATE.update(running=False)
+    for suffix in ("json", "png"):
+        verification_path(suffix).unlink(missing_ok=True)
+
+
+def task_status():
+    with TASK_STATE_LOCK:
+        state = dict(TASK_STATE)
+    state["stage"] = read_stage() if state["running"] else None
+    state["manual_verification"] = False
+    if state["running"]:
+        try:
+            info = json.loads(verification_path("json").read_text(encoding="ascii"))
+            remaining = int(info["wait_seconds"] - (time.time() - info["since"]))
+            if info.get("waiting") is True and remaining > 0:
+                state.update(manual_verification=True, remaining_seconds=min(remaining, 900))
+        except (OSError, ValueError, TypeError, KeyError):
+            pass
+    return state
 
 
 def begin_login(profile_id):
@@ -44,6 +80,8 @@ def begin_login(profile_id):
             with LOGIN_STATE_LOCK:
                 LOGIN_STATE.update(running=False, result=result)
             print("Login job finished: " + ("saved" if result.get("login_saved") else "failed"), flush=True)
+            for suffix in ("json", "png"):
+                verification_path(suffix).unlink(missing_ok=True)
             LOCK.release()
     threading.Thread(target=login_job, daemon=True).start()
     return 202, {"ok": True, "profile_id": profile_id}
@@ -60,6 +98,8 @@ def read_stage():
 
 
 def execute_job(job):
+    for suffix in ("json", "png"):
+        verification_path(suffix).unlink(missing_ok=True)
     try:
         STAGE_FILE.unlink()  # 每个任务从干净状态开始，避免读到上一次的残留
     except OSError:
@@ -146,10 +186,65 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def desktop_proxy(self):
+        if not self.require_auth(browser=True):
+            return
+        target = self.path[len("/desktop"):]
+        if self.headers.get("Upgrade", "").lower() != "websocket":
+            connection = http.client.HTTPConnection(*DESKTOP_BACKEND, timeout=10)
+            sent = False
+            try:
+                connection.request("GET", target)
+                response = connection.getresponse()
+                body = response.read(5000001)
+                if len(body) > 5000000:
+                    raise ValueError()
+                self.send_response(response.status)
+                self.send_header("Content-Type", response.getheader("Content-Type", "application/octet-stream"))
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                sent = True
+                self.wfile.write(body)
+            except (OSError, ValueError, http.client.HTTPException):
+                if not sent:
+                    self.reply(502, {"ok": False, "error": "desktop_unavailable"})
+            finally:
+                connection.close()
+            return
+        origin = self.headers.get("Origin")
+        host = self.headers.get("X-Forwarded-Host", self.headers.get("Host", "")).split(",")[0].strip()
+        if origin and urlsplit(origin).netloc != host:
+            self.reply(403, {"ok": False})
+            return
+        self.close_connection = True
+        try:
+            with socket.create_connection(DESKTOP_BACKEND, timeout=10) as upstream:
+                headers = [f"GET {target} HTTP/1.1", f"Host: {DESKTOP_BACKEND[0]}:{DESKTOP_BACKEND[1]}"]
+                for name in ("Upgrade", "Connection", "Sec-WebSocket-Key", "Sec-WebSocket-Version", "Sec-WebSocket-Protocol"):
+                    if self.headers.get(name):
+                        headers.append(name + ": " + self.headers[name])
+                # Do not forward the API password or application cookies.
+                upstream.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
+                self.connection.settimeout(20)
+                upstream.settimeout(20)
+                while True:
+                    ready, _, _ = select.select([self.connection, upstream], [], [], 1)
+                    for source in ready:
+                        data = source.recv(65536)
+                        if not data:
+                            return
+                        (upstream if source is self.connection else self.connection).sendall(data)
+        except OSError:
+            return
+
     def do_GET(self):
-        if self.path == "/health":
+        path = self.path.partition("?")[0]
+        if path.startswith("/desktop/"):
+            self.desktop_proxy()
+        elif path == "/health":
             self.reply(200, {"ok": True, "service": "glados-browser", "version": VERSION})
-        elif self.path == "/":
+        elif path == "/":
             if not self.require_auth(browser=True):
                 return
             body = Path(__file__).with_name("login.html").read_bytes()
@@ -160,7 +255,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Frame-Options", "DENY")
             self.end_headers()
             self.wfile.write(body)
-        elif self.path == "/login/status":
+        elif path == "/task/status":
+            if not self.require_auth():
+                return
+            self.reply(200, dict(task_status(), ok=True))
+        elif path == "/verification.png":
+            if not self.require_auth():
+                return
+            state = task_status()
+            if (not state["manual_verification"] or
+                    self.headers.get("X-Glados-Job", state.get("job_id")) != state.get("job_id")):
+                self.reply(404, {"ok": False})
+                return
+            try:
+                body = verification_path("png").read_bytes()
+                if len(body) > 1000000 or not body.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError()
+            except (OSError, ValueError):
+                self.reply(404, {"ok": False})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/login/status":
             if not self.require_auth():
                 return
             with LOGIN_STATE_LOCK:
@@ -209,7 +329,13 @@ class Handler(BaseHTTPRequestHandler):
             if not selftest and session_mode == "cookie" and (not isinstance(job.get("cookie"), str) or not 0 < len(job["cookie"]) <= 32000):
                 raise ValueError()
             timeout = job.get("timeout", 180)
-            if type(timeout) is not int or not 60 <= timeout <= 600:
+            if type(timeout) is not int or not 60 <= timeout <= 1200:
+                raise ValueError()
+            manual_wait = job.get("manual_wait", 300)
+            if type(manual_wait) is not int or not 0 <= manual_wait <= 900:
+                raise ValueError()
+            job_id = job.get("job_id", "")
+            if not isinstance(job_id, str) or len(job_id) > 64 or (job_id and (not job_id.isascii() or not job_id.isalnum())):
                 raise ValueError()
             agent = job.get("user_agent")
             if agent is not None and (
@@ -222,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
                 "user_agent": agent if session_mode == "cookie" else None,
                 "timeout": timeout, "operation": "selftest" if selftest else "checkin",
                 "session_mode": "cookie" if selftest else session_mode, "profile_id": profile_id,
+                "manual_wait": manual_wait, "job_id": job_id,
             }
         except (ValueError, OSError):
             self.reply(400, {"ok": False, "error": "invalid_request"})
@@ -231,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self.connection.settimeout(timeout + 20)
+            with TASK_STATE_LOCK:
+                TASK_STATE.update(running=True, operation=job["operation"], profile_id=profile_id, job_id=job_id)
             # 打开始时间，否则只有结束那一行，任务耗时永远算不出来。
             # 只打 timeout 和操作类型，不含 Cookie / UA。
             print("Browser job started: timeout=%d operation=%s" % (timeout, job["operation"]), flush=True)
@@ -251,10 +380,12 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(filename, str) and filename.isascii() and filename.replace("_", "").replace(".", "").isalnum() and len(filename) <= 64 and type(line) is int:
                 label += " location=" + filename + ":" + str(line)
             print("Browser job finished: " + label, flush=True)
+            clear_task_state()
             self.reply(200, result)
         except Exception:
             self.reply(500, {"ok": False, "error": "browser_error"})
         finally:
+            clear_task_state()
             LOCK.release()
 
 

@@ -15,13 +15,14 @@ input{font:inherit;width:60px;padding:6px}#status{white-space:pre-wrap;backgroun
 <p>远程桌面要求输入你设置的 <code>GLADOS_VNC_PASSWORD</code>。浏览器启动可能需要约 2–3 分钟。进入 GLaDOS 官网后完成登录，确认能看到账号页，再回来保存。</p>
 <button id="finish">3. 保存登录并关闭浏览器</button>
 <p id="status" role="status">尚未启动登录。</p>
+<div id="verification" hidden><p>当前签到任务正在等待验证。打开远程浏览器完成验证即可，脚本会自动继续；不要启动新的登录任务。</p><img id="verification-image" alt="当前验证组件局部截图" style="max-width:100%;border:1px solid #dce2dc" hidden></div>
 <small>一次只登录一个账号，最长保留 15 分钟。保存期间不要再点击签到；登录操作本身不会自动签到。多账号请逐个选择编号登录。</small>
 </main>
 <script>
 const statusBox=document.getElementById('status'), start=document.getElementById('start');
-const desktop=new URL(location.href); desktop.port='8094'; desktop.pathname='/vnc.html'; desktop.search='autoconnect=true&resize=scale';
+const desktop=new URL('/desktop/vnc.html?autoconnect=true&resize=scale&path=desktop/websockify',location.href);
 document.getElementById('desktop').href=desktop.href;
-const stages={start_browser:'正在启动浏览器，请稍候',manual_login:'浏览器已打开，等待你登录并点击保存',manual_login_incomplete:'尚未确认登录，请在远程浏览器完成登录后再次保存',login_saved:'登录已保存',open_checkin_page_uc_open:'正在打开官网',open_checkin_page_reconnect:'正在连接浏览器'};
+const stages={start_browser:'正在启动浏览器，请稍候',manual_login:'浏览器已打开，等待你登录并点击保存',manual_login_incomplete:'尚未确认登录，请在远程浏览器完成登录后再次保存',login_saved:'登录已保存',open_checkin_page_uc_open:'正在打开官网',open_checkin_page_reconnect:'正在连接浏览器',verification_wait:'正在等待验证组件',verification_click:'正在自动尝试验证',verification_ready:'组件已返回验证结果，等待签到接口确认',manual_verification:'等待人工验证，完成后自动继续'};
 async function post(path,body={}){
  const r=await fetch(path,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-Glados-UI':'1'},body:JSON.stringify(body)});
  const d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d;
@@ -30,7 +31,17 @@ start.onclick=async()=>{try{await post('/login/start',{profile_id:Number(documen
 document.getElementById('finish').onclick=async()=>{try{await post('/login/finish');statusBox.textContent='正在确认登录并保存，请稍候…';}catch(e){statusBox.textContent=e.message;}};
 async function poll(){try{
  const r=await fetch('/login/status',{credentials:'same-origin'});if(!r.ok)return;const d=await r.json();
- start.disabled=d.running;
+ const taskResponse=await fetch('/task/status',{credentials:'same-origin'});const task=taskResponse.ok?await taskResponse.json():{};
+ start.disabled=d.running||task.running;
+ document.getElementById('finish').disabled=!d.running;
+ const panel=document.getElementById('verification'),picture=document.getElementById('verification-image');
+ panel.hidden=!task.manual_verification;
+ if(task.manual_verification){
+   if(picture.dataset.job!==task.job_id){picture.dataset.job=task.job_id;picture.src='/verification.png?t='+Date.now();picture.hidden=false;picture.onerror=()=>{picture.hidden=true;};}
+   statusBox.textContent='账号 '+task.profile_id+' 等待人工验证，剩余约 '+task.remaining_seconds+' 秒。只需打开远程浏览器完成验证。';
+   return;
+ }
+ if(task.running){statusBox.textContent='账号 '+task.profile_id+'：'+(stages[task.stage]||'签到任务运行中');return;}
  if(d.running){statusBox.textContent='账号 '+d.profile_id+'：'+(stages[d.stage]||'处理中，请稍候');}
  else if(d.result){statusBox.textContent=d.result.login_saved?'账号 '+d.profile_id+' 登录已保存。可以在青龙启用 profile 会话模式并运行签到。':'登录未保存：'+(d.result.error||'browser_error')+' '+(d.result.stage||'')+' '+(d.result.diagnostic||'');}
 }catch(e){statusBox.textContent='服务连接中断，请检查容器状态';}}

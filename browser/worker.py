@@ -8,6 +8,7 @@ import sys
 import tempfile
 import time
 import traceback
+import base64
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -131,6 +132,8 @@ def watchdog(seconds):
 
 # Observe only the actual official-page POST response. No requests are synthesized.
 OBSERVER = r"""(() => {
+  if (window.__gladosObserverInstalled) return;
+  window.__gladosObserverInstalled = true;
   window.__gladosCheckinResult = null;
   const record = (url, body) => {
     try {
@@ -170,15 +173,6 @@ OBSERVER = r"""(() => {
 })();
 """
 
-# 页面是否已经加载了 Cloudflare Turnstile。
-# 不能用 querySelector 查 iframe：Turnstile 组件渲染在 closed shadow DOM 里，
-# document.querySelectorAll('iframe') 看不到它（实测资源有加载、DOM 查询为空）。
-# 资源加载记录（Resource Timing）能穿透 shadow DOM，是可靠信号。
-CF_PRESENT_JS = r"""
-const res = performance.getEntriesByType('resource') || [];
-return res.some(e => String(e.name).indexOf('challenges.cloudflare.com') >= 0);
-"""
-
 # 判断并点击签到按钮。返回 'clicked' / 'hidden' / 'missing'。
 # 不用 sb.is_element_visible + sb.click：前者会把带 :not([disabled]) 的 CSS 选择器
 # 误判成链接文本而永远返回 False；后者依赖真实鼠标位置，被遮罩挡住就失败。
@@ -208,6 +202,161 @@ fetch('/api/user/status', {credentials: 'same-origin'})
     data: d.data ? {email: d.data.email, leftDays: d.data.leftDays} : null}))
   .catch(() => done(null));
 """
+
+# Return booleans only. Never return, log, persist or replay the provider token.
+TURNSTILE_STATE_JS = r"""
+const inputs = Array.from(document.querySelectorAll('input[name="cf-turnstile-response"]'));
+let response = inputs.some(e => !!e.value), widget = inputs.length > 0;
+try {
+  if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+    const r = window.turnstile.getResponse(); widget = true; response = !!r;
+    if (typeof window.turnstile.isExpired === 'function' && window.turnstile.isExpired()) response = false;
+  }
+} catch (_) {}
+const resources = performance.getEntriesByType('resource').some(e => {
+  try { return new URL(e.name).hostname === 'challenges.cloudflare.com'; } catch (_) { return false; }
+});
+return {state: response ? 'ready' : widget ? 'pending' : 'absent', resources};
+"""
+
+
+def verification_file(suffix):
+    return Path(STAGE_FILE).with_name("glados-verification." + suffix)
+
+
+def clear_verification():
+    for suffix in ("json", "png"):
+        verification_file(suffix).unlink(missing_ok=True)
+
+
+def find_turnstile_frame(driver):
+    """Locate a visible provider iframe, including inside closed shadow roots."""
+    driver.execute_cdp_cmd("DOM.enable", {})
+    root = driver.execute_cdp_cmd("DOM.getDocument", {"depth": -1, "pierce": True})["root"]
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        stack.extend(node.get("children", []))
+        stack.extend(node.get("shadowRoots", []))
+        # Do not descend into nested documents: their rectangles use a
+        # different coordinate system. Closed shadow roots share this page.
+        if node.get("nodeName", "").upper() != "IFRAME":
+            continue
+        attrs = node.get("attributes", [])
+        attrs = dict(zip(attrs[::2], attrs[1::2]))
+        url = urlsplit(attrs.get("src", ""))
+        if url.scheme != "https" or url.hostname != "challenges.cloudflare.com":
+            continue
+        if "/turnstile/" not in url.path and "/challenge-platform/" not in url.path:
+            continue
+        obj = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": node["backendNodeId"]})["object"]["objectId"]
+        try:
+            box = driver.execute_cdp_cmd("Runtime.callFunctionOn", {
+                "objectId": obj, "returnByValue": True,
+                "functionDeclaration": "function(){this.scrollIntoView({block:'center'});const r=this.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height};}",
+            }).get("result", {}).get("value", {})
+        finally:
+            driver.execute_cdp_cmd("Runtime.releaseObject", {"objectId": obj})
+        # Only the compact checkbox widget, not a full-screen/puzzle challenge.
+        if 150 <= box.get("width", 0) <= 800 and 40 <= box.get("height", 0) <= 200:
+            return box
+    return None
+
+
+def capture_verification(driver, box):
+    if not box:
+        return
+    scroll = driver.execute_script("return {x:scrollX,y:scrollY}")
+    result = driver.execute_cdp_cmd("Page.captureScreenshot", {
+        "format": "png", "captureBeyondViewport": False,
+        "clip": {"x": box["x"] + scroll["x"], "y": box["y"] + scroll["y"],
+                 "width": box["width"], "height": box["height"], "scale": 1},
+    })
+    data = base64.b64decode(result["data"])
+    if len(data) > 1000000 or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return
+    path = verification_file("png")
+    path.write_bytes(data)
+    path.chmod(0o600)
+
+
+def click_turnstile_checkbox(browser, box):
+    import pyautogui
+    driver = browser.driver
+    driver.execute_cdp_cmd("Page.bringToFront", {})
+    metrics = driver.execute_script("return {x:screenX,y:screenY,w:outerWidth-innerWidth,h:outerHeight-innerHeight,ratio:devicePixelRatio,iw:innerWidth,ih:innerHeight}")
+    # NAS Xvfb uses unscaled pixels. Avoid guessing when scaling differs.
+    if abs(metrics["ratio"] - 1) > 0.05:
+        return False
+    x, y = box["x"] + 30, box["y"] + min(32, box["height"] / 2)
+    if not (0 <= x < metrics["iw"] and 0 <= y < metrics["ih"]):
+        return False
+    border = max(0, metrics["w"] / 2)
+    pyautogui.click(metrics["x"] + border + x, metrics["y"] + metrics["h"] - border + y)
+    return True
+
+
+class TurnstileController:
+    def __init__(self, manual_wait=300, auto_wait=35, deadline=None):
+        self.manual_wait = manual_wait
+        self.auto_wait = auto_wait
+        self.since = None
+        self.manual_since = None
+        self.last_attempt = None
+        self.attempts = 0
+        self.deadline = deadline
+
+    def tick(self, browser, progress):
+        now = time.monotonic()
+        state = browser.execute_script(TURNSTILE_STATE_JS) or {}
+        if state.get("state") == "ready":
+            if self.since is not None:
+                mark(progress, "verification_ready")
+            self.since = self.manual_since = None
+            clear_verification()
+            return "ready"
+        box = None
+        if state.get("state") == "pending" or state.get("resources"):
+            try:
+                box = find_turnstile_frame(browser.driver)
+            except Exception:
+                pass
+        if state.get("state") != "pending" and box is None:
+            if self.manual_since is not None:
+                clear_verification()
+            self.since = self.manual_since = None
+            return "absent"
+        if self.since is None:
+            self.since = now
+        if self.manual_since is not None:
+            mark(progress, "manual_verification")
+            return "expired" if now - self.manual_since >= self.manual_wait else "manual"
+        mark(progress, "verification_wait")
+        if (box and now - self.since >= 5 and self.attempts < 3
+                and (self.last_attempt is None or now - self.last_attempt >= 8)):
+            self.attempts += 1
+            self.last_attempt = now
+            mark(progress, "verification_click")
+            try:
+                click_turnstile_checkbox(browser, box)
+            except Exception:
+                pass
+        exhausted = self.attempts >= 3 and now - self.last_attempt >= 8
+        if now - self.since >= self.auto_wait or exhausted:
+            self.manual_since = now
+            if self.deadline is not None:
+                self.manual_wait = min(self.manual_wait, max(0, int(self.deadline - now)))
+            try:
+                capture_verification(browser.driver, box)
+            except Exception:
+                pass
+            data = {"waiting": True, "since": time.time(), "wait_seconds": self.manual_wait}
+            path = verification_file("json")
+            path.write_text(json.dumps(data), encoding="ascii")
+            path.chmod(0o600)
+            mark(progress, "manual_verification")
+            return "manual" if self.manual_wait else "expired"
+        return "pending"
 
 
 def parse_cookies(raw):
@@ -258,8 +407,9 @@ def run_browser(job, progress=None):
     # SB 的 teardown（关 Chrome 需数秒），期间 worker 已被 SIGKILL，
     # 真实 stage 永远回不到日志里，只剩一行裸的 "failed"。
     requested = int(job.get("timeout", 180))
-    budget = max(30, min(requested - 25, 875 if login else 575))
+    budget = max(30, min(requested - 25, 875 if login else 1175))
     deadline = time.monotonic() + budget
+    verification = TurnstileController(manual_wait=job.get("manual_wait", 300), deadline=deadline)
     options = {
         "uc": True, "headless": False, "headed": True, "locale": "en",
         "xvfb": sys.platform.startswith("linux") and not os.environ.get("DISPLAY"), "chromium_arg": CHROME_ARGS,
@@ -325,6 +475,9 @@ def run_browser(job, progress=None):
                 mark(progress, "manual_login")
                 finish = Path(job["finish_file"])
                 while time.monotonic() < deadline:
+                    if urlsplit(sb.driver.current_url).netloc == urlsplit(ORIGIN).netloc:
+                        if verification.tick(sb, progress) in ("absent", "ready"):
+                            mark(progress, "manual_login")
                     if finish.exists():
                         finish.unlink(missing_ok=True)
                         if urlsplit(sb.driver.current_url).netloc != urlsplit(ORIGIN).netloc:
@@ -345,8 +498,6 @@ def run_browser(job, progress=None):
             sb.execute_script(OBSERVER)
             mark(progress, "wait_checkin_page")
             clicked = False
-            captcha_tried = False
-            last_gui_attempt = 0.0
             while time.monotonic() < deadline:
                 current = sb.driver.current_url
                 if current.startswith(ORIGIN + "/authenticate") or current.startswith(ORIGIN + "/login"):
@@ -355,28 +506,18 @@ def run_browser(job, progress=None):
                 if not current.startswith(ORIGIN + "/"):
                     mark(progress, "offsite_redirect")
                     return {"ok": False, "error": "login_required", "stage": progress["stage"]}
+                # A top-level challenge may reload the document after solving.
+                # Reinstall idempotently; never erase an already captured reply.
+                sb.execute_script(OBSERVER)
                 result = sb.execute_script("return window.__gladosCheckinResult || null")
                 if result:
                     mark(progress, "read_status")
                     state = sb.driver.execute_async_script(STATUS_QUERY)
                     return {"ok": True, "checkin": result, "state": state, "stage": progress["stage"]}
-                # 只在「已点击」之后才处理挑战：Turnstile 是点击时才开始要 token 的，
-                # 提前用 pyautogui 在屏幕上点会误触页面里其他按钮（该页有 13 个）。
-                if clicked and time.monotonic() - last_gui_attempt >= 4:
-                    last_gui_attempt = time.monotonic()
-                    try:
-                        if sb.execute_script(CF_PRESENT_JS):
-                            if not captcha_tried:
-                                mark(progress, "solve_captcha")
-                                captcha_tried = True
-                            # SeleniumBase 不同版本方法名不同，取存在的那个。
-                            clicker = (getattr(sb, "uc_gui_click_captcha", None)
-                                        or getattr(sb, "uc_gui_click_cf", None))
-                            if clicker is not None:
-                                clicker()
-                    except Exception:
-                        pass
-                if not clicked:
+                verification_state = verification.tick(sb, progress)
+                if verification_state == "expired":
+                    return {"ok": False, "error": "verification_required", "stage": progress["stage"]}
+                if not clicked and verification_state in ("absent", "ready"):
                     # 不用 sb.is_element_visible / sb.click：
                     # 带 :not([disabled]) 伪类的 CSS 选择器会被 SeleniumBase 误判成
                     # 链接文本，导致永远返回 False（实测按钮可点却一次没点到）；
@@ -403,7 +544,7 @@ def run_browser(job, progress=None):
                     return {"ok": False, "error": "button_not_found", "stage": progress["stage"]}
                 if ui.get("disabled"):
                     return {"ok": False, "error": "button_disabled", "stage": progress["stage"]}
-            return {"ok": False, "error": "verification_required" if clicked else "page_changed",
+            return {"ok": False, "error": "checkin_unknown" if clicked else "page_changed",
                     "stage": progress["stage"]}
 
 

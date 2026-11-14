@@ -14,6 +14,8 @@ import ssl
 import sys
 import time
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from urllib.parse import urlsplit
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
@@ -39,7 +41,7 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_RETRIES = 3
 DEFAULT_SERVICE_RETRIES = 3
 DEFAULT_SERVICE_RETRY_DELAY = 30
-SCRIPT_VERSION = "2026-11-11.6"
+SCRIPT_VERSION = "2026-11-14.7"
 
 
 class RetryableRequestError(RuntimeError):
@@ -82,7 +84,7 @@ def split_recipients(raw_recipients: str) -> List[str]:
     return [address.strip() for address in normalized.split(",") if address.strip()]
 
 
-def send_failure_email(subject: str, content: str) -> bool:
+def send_failure_email(subject: str, content: str, image_data: Optional[bytes] = None) -> bool:
     """通过 SMTP 发送失败告警；未配置邮件时仅记录日志。"""
     host = os.environ.get("EMAIL_SMTP_HOST", "").strip()
     user = os.environ.get("EMAIL_SMTP_USER", "").strip()
@@ -121,6 +123,8 @@ def send_failure_email(subject: str, content: str) -> bool:
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     message.set_content(content)
+    if image_data:
+        message.add_attachment(image_data, maintype="image", subtype="png", filename="verification.png")
 
     try:
         tls_context = ssl.create_default_context()
@@ -138,7 +142,7 @@ def send_failure_email(subject: str, content: str) -> bool:
                 smtp.ehlo()
             smtp.login(user, password)
             smtp.send_message(message)
-        print(f"失败告警邮件已发送至: {', '.join(recipients)}")
+        print(f"邮件已发送至: {', '.join(recipients)}")
         return True
     except (OSError, smtplib.SMTPException) as exc:
         print(f"失败告警邮件发送失败: {exc}")
@@ -430,6 +434,72 @@ def checkin_account(
     return f"{email} ---- {message} ---- 剩余 {left_days} 天"
 
 
+def notify_verification(base_url: str, token: str, job_id: str, account_no: int, remaining: int) -> None:
+    public_url = os.environ.get("GLADOS_BROWSER_PUBLIC_URL", "").strip().rstrip("/")
+    public = urlsplit(public_url)
+    if public_url and (public.scheme != "https" or not public.hostname or public.username or public.password
+                       or public.query or public.fragment or public.path):
+        public_url = ""
+    desktop_path = "/desktop/vnc.html?autoconnect=true&resize=scale&path=desktop/websockify"
+    links = f"局域网管理页：{base_url}/\n局域网验证界面：{base_url}{desktop_path}\n"
+    if public_url:
+        links += f"外网管理页：{public_url}/\n外网验证界面：{public_url}{desktop_path}\n"
+    else:
+        links += "外网入口尚未配置，请在青龙填写 GLADOS_BROWSER_PUBLIC_URL（绿联转发到 8093 的 HTTPS 地址）。\n"
+    content = (
+        f"GLaDOS 账号 {account_no} 需要人工验证\n自动尝试尚未完成，当前浏览器继续保留，"
+        f"剩余约 {remaining} 秒。完成人机验证后脚本会自动继续签到。\n"
+        + links + "只需在当前远程浏览器完成验证，不要启动新的登录或签到任务。\n"
+        "管理页用户名 glados、密码为原调用密钥；远程桌面使用 VNC 密码。链接本身不含凭据。"
+    )
+    print(content, flush=True)
+    image_data = None
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.get(base_url + "/verification.png", headers={
+                "Authorization": "Bearer " + token, "X-Glados-Job": job_id,
+            }, timeout=(3, 5), allow_redirects=False)
+            if response.status_code == 200 and len(response.content) <= 1000000 and response.content.startswith(b"\x89PNG\r\n\x1a\n"):
+                image_data = response.content
+    except requests.RequestException:
+        pass
+    send_wecom(os.environ.get("WECOM_WEBHOOK", "").strip(), content, 0, 10)
+    send_failure_email("GLaDOS 等待人工验证", content, image_data)
+
+
+def browser_post_with_progress(base_url: str, token: str, payload: Dict[str, Any], account_no: int, selftest: bool):
+    def post():
+        with requests.Session() as session:
+            session.trust_env = False
+            return session.post(
+                base_url + ("/selftest" if selftest else "/checkin"),
+                headers={"Authorization": "Bearer " + token}, json=payload,
+                timeout=(10, payload["timeout"] + 20), allow_redirects=False,
+            )
+    # Exactly one POST. Monitoring is read-only and never replays a timed-out job.
+    with ThreadPoolExecutor(max_workers=1) as executor, requests.Session() as monitor:
+        monitor.trust_env = False
+        future = executor.submit(post)
+        notified = False
+        while True:
+            try:
+                return future.result(timeout=2)
+            except FutureTimeout:
+                if selftest or notified:
+                    continue
+                try:
+                    response = monitor.get(base_url + "/task/status", headers={"Authorization": "Bearer " + token},
+                                           timeout=(3, 5), allow_redirects=False)
+                    status = response.json() if response.status_code == 200 else {}
+                    if (isinstance(status, dict) and status.get("job_id") == payload["job_id"]
+                            and status.get("manual_verification") is True):
+                        notified = True
+                        notify_verification(base_url, token, payload["job_id"], account_no, int(status.get("remaining_seconds", 0)))
+                except (requests.RequestException, ValueError, TypeError):
+                    pass
+
+
 def browser_service_request(cookie: str, account_no: int, selftest: bool = False) -> Dict[str, Any]:
     session_mode = os.environ.get("GLADOS_BROWSER_SESSION", "cookie").strip().lower()
     if session_mode not in ("cookie", "profile"):
@@ -445,32 +515,28 @@ def browser_service_request(cookie: str, account_no: int, selftest: bool = False
     if len(token) < 32 or not token.isascii() or any(c.isspace() for c in token):
         raise RuntimeError("GLADOS_BROWSER_TOKEN 至少需要 32 个无空格 ASCII 字符，并与浏览器容器一致")
     timeout = env_int("GLADOS_BROWSER_TIMEOUT", 420 if profile_mode else 180, 60, 600)
+    manual_wait = 0 if selftest else env_int("GLADOS_MANUAL_WAIT", 300, 0, 540)
+    total_timeout = timeout + manual_wait + (30 if manual_wait else 0)
     print(
         f"浏览器环境自检（最长 {timeout} 秒，不访问 GLaDOS）" if selftest else
-        f"账号 {account_no} 使用 NAS 浏览器签到（最长 {timeout} 秒）", flush=True,
+        f"账号 {account_no} 使用 NAS 浏览器签到（总上限 {total_timeout} 秒，含人工等待 {manual_wait} 秒）", flush=True,
     )
     try:
         # 此请求会触发真实签到，超时后状态未知，禁止自动重放或回退到 HTTP 模式。
-        with requests.Session() as session:
-            session.trust_env = False  # NAS 内网调用不经过全局 HTTP_PROXY。
-            response = session.post(
-                base_url + ("/selftest" if selftest else "/checkin"),
-                headers={"Authorization": "Bearer " + token},
-                json={
-                    "cookie": "" if profile_mode else cookie, "timeout": timeout,
+        response = browser_post_with_progress(base_url, token, {
+                    "cookie": "" if profile_mode else cookie, "timeout": total_timeout,
+                    "manual_wait": manual_wait, "job_id": uuid.uuid4().hex,
                     "session_mode": "profile" if profile_mode else "cookie",
                     "profile_id": account_no if profile_mode else 1,
                     "user_agent": browser_user_agent() if not profile_mode and os.environ.get("GLADOS_USER_AGENT", "").strip() else None,
-                },
-                timeout=(10, timeout + 20), allow_redirects=False,
-            )
-            if response.status_code == 401:
-                raise RuntimeError("浏览器服务密钥不匹配，请核对两边 GLADOS_BROWSER_TOKEN")
-            if response.status_code == 409:
-                raise RuntimeError("浏览器服务正在执行另一项签到，请等待原任务结束")
-            if response.status_code != 200:
-                raise RuntimeError(f"浏览器服务返回 HTTP {response.status_code}，未重试")
-            result = response.json()
+                }, account_no, selftest)
+        if response.status_code == 401:
+            raise RuntimeError("浏览器服务密钥不匹配，请核对两边 GLADOS_BROWSER_TOKEN")
+        if response.status_code == 409:
+            raise RuntimeError("浏览器服务正在执行另一项签到，请等待原任务结束")
+        if response.status_code != 200:
+            raise RuntimeError(f"浏览器服务返回 HTTP {response.status_code}，未重试")
+        result = response.json()
     except requests.Timeout:
         raise RuntimeError("浏览器服务调用超时，签到状态未知；请先核对官网流水，不会自动重试") from None
     except (requests.RequestException, ValueError) as exc:
@@ -490,6 +556,7 @@ def browser_service_request(cookie: str, account_no: int, selftest: bool = False
             "profile_origin_mismatch": "保存会话的域名与 GLADOS_ORIGIN 不一致，请保持原域名或在当前域名重新登录保存",
             "button_not_found": "未找到官网签到按钮，请核对登录状态或页面结构",
             "button_disabled": "官网签到按钮处于禁用状态，请核对页面上的实际提示",
+            "checkin_unknown": "已点击签到，但未收到明确结果；请先核对官网流水，不会自动重放",
         }
         message = reasons.get(result.get("error"), "浏览器服务执行失败")
         details = []
